@@ -93,8 +93,7 @@ test("runtime verification: user pairs an app, runs a check, and saves and repla
 test("runtime verification: real cross-origin SDK observes actions, fails broken checkout, and replays a saved fix", async ({ page, context, request, runPhantom, targetApp }) => {
   await seedRunPhantomFixtures(runPhantom.url);
   const session = await connectTarget(page, request, runPhantom, targetApp.origin, FIXTURE_PRIMARY_RUN_ID);
-  const filled = await act(request, runPhantom, session.id, { type: "fill", selector: "#name", value: "Ada" });
-  expect(filled).toBeGreaterThanOrEqual(0);
+  await act(request, runPhantom, session.id, { type: "fill", selector: "#name", value: "Ada" });
   await expect(page.locator("#name")).toHaveValue("Ada");
 
   const beforeBroken = await act(request, runPhantom, session.id, { type: "click", selector: "#checkout" });
