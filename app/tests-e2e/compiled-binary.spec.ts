@@ -18,6 +18,12 @@ test("compiled binary serves its embedded Run Phantom UI", async ({ page }) => {
   expect(clearResponse.ok).toBe(true);
   const demoResponse = await fetch(`${compiledUrl}/api/demo-traces/replay`, { method: "POST" });
   expect(demoResponse.ok).toBe(true);
+  // The regression this gate exists for: both listings returned 503 from the
+  // binary while the UI still rendered, because the listing worker was not embedded.
+  for (const route of ["/api/agent/sessions", "/api/claude/sessions"]) {
+    const response = await fetch(`${compiledUrl}${route}`);
+    expect(response.status, route).toBe(200);
+  }
 
   await page.goto(`${compiledUrl}/runs`);
   await expect(page).toHaveTitle("Run Phantom");

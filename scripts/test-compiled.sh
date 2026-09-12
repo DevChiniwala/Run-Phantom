@@ -33,15 +33,36 @@ fi
 # realpath: the secret store refuses symlinked path components, and on macOS
 # /tmp is a symlink to /private/tmp, so a raw mktemp path makes the daemon
 # reject its own store.
-STATE_DIR="$(cd "$(mktemp -d)" && pwd -P)"
+# mktemp is checked on its own line: inside a nested substitution its failure is
+# invisible to set -e, `cd ""` succeeds, and STATE_DIR would silently become the
+# checkout that cleanup then deletes.
+TMP_ROOT="$(mktemp -d)" || { echo "[test-compiled] mktemp failed" >&2; exit 1; }
+STATE_DIR="$(cd "$TMP_ROOT" && pwd -P)"
+REPO_REAL="$(pwd -P)"
+case "$STATE_DIR" in
+  ""|/|"$REPO_REAL"|"$REPO_REAL"/*|"$HOME")
+    echo "[test-compiled] refusing unsafe state directory: '$STATE_DIR'" >&2
+    exit 1
+    ;;
+esac
 PORT="${RUNPHANTOM_TEST_PORT:-5983}"
 DAEMON_PID=""
 
 cleanup() {
-  [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+  if [ -n "$DAEMON_PID" ]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
   rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
+
+# Anything already answering on the port would be tested, and cleared, in place
+# of the binary this script just built.
+if curl -s -o /dev/null "http://127.0.0.1:$PORT/health"; then
+  echo "[test-compiled] port $PORT is already in use; set RUNPHANTOM_TEST_PORT" >&2
+  exit 1
+fi
 
 echo "[test-compiled] serving on :$PORT"
 HOME="$STATE_DIR" \
@@ -52,6 +73,11 @@ RUNPHANTOM_SECRET_STORE_PATH="$STATE_DIR/secrets.json" \
 DAEMON_PID=$!
 
 for _ in $(seq 1 60); do
+  kill -0 "$DAEMON_PID" 2>/dev/null || {
+    echo "[test-compiled] daemon exited before becoming healthy:" >&2
+    tail -40 "$STATE_DIR/daemon.log" >&2
+    exit 1
+  }
   curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 1
 done
@@ -62,11 +88,11 @@ curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || {
 }
 
 echo "[test-compiled] running native smoke gate"
+STATUS=0
 cd app
 RUNPHANTOM_COMPILED_URL="http://127.0.0.1:$PORT" \
 RUNPHANTOM_SCREENSHOT_DIR="${RUNPHANTOM_SCREENSHOT_DIR:-$STATE_DIR/shots}" \
-  bun x playwright test tests-e2e/compiled-binary.spec.ts
-STATUS=$?
+  bun x playwright test tests-e2e/compiled-binary.spec.ts || STATUS=$?
 cd "$REPO_ROOT"
 
 # A route can 503 while the page still renders, so the assertions alone do not
@@ -77,5 +103,5 @@ if grep -q "ModuleNotFound" "$STATE_DIR/daemon.log"; then
   exit 1
 fi
 
+[ "$STATUS" -eq 0 ] || { echo "[test-compiled] smoke gate failed" >&2; exit "$STATUS"; }
 echo "[test-compiled] ok"
-exit $STATUS
