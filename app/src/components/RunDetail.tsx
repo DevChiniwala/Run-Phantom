@@ -678,8 +678,8 @@ function ViewHeader({
         </div>
       ) : (
         <>
-          <div className="mb-1 flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-            <div className="flex min-w-0 items-center gap-2">
+          <div data-run-header className="mb-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+            <div data-run-header-title className="flex min-w-[12rem] flex-1 items-center gap-2">
               <div
                 className={`w-2 h-2 rounded-full flex-shrink-0 ${active ? "pulse-dot" : ""}`}
                 style={{ background: statusColor }}
@@ -694,6 +694,7 @@ function ViewHeader({
                 <h2 className="truncate" style={{ fontSize: "15px", fontWeight: 600, color: C.fg4 }}>{displayTitle}</h2>
               )}
               <span
+                data-run-status
                 className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium"
                 style={{ color: statusColor, background: active ? "color-mix(in oklch, var(--rp-success) 12%, transparent)" : stats.errors > 0 ? "color-mix(in oklch, var(--rp-danger) 10%, transparent)" : "var(--rp-ink-wash)" }}
               >
@@ -701,7 +702,7 @@ function ViewHeader({
               </span>
             </div>
             {!active && (
-              <div ref={optionsRef} className="relative flex shrink-0 flex-wrap items-center gap-1.5 sm:justify-end">
+              <div ref={optionsRef} data-run-actions className="relative flex min-w-0 flex-wrap items-center gap-1.5">
                 {onAnnotateRun && (
                   <>
                     <button

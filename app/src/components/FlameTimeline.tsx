@@ -88,13 +88,27 @@ function SpanTooltip({
   const pad = 8;
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const maxH = Math.min(H, Math.max(0, vh - 2 * pad));
+  const MIN_H = 160;
+  let maxH = Math.min(H, Math.max(0, vh - 2 * pad));
   let left = barRect.left + barRect.width / 2 - W / 2;
-  let top = barRect.bottom + pad;
   if (left + W > vw - pad) left = vw - W - pad;
   if (left < pad) left = pad;
-  if (top + maxH > vh - pad) top = barRect.top - maxH - pad;
-  top = Math.max(pad, Math.min(top, vh - maxH - pad));
+  // Never cover the bar: clamping a tooltip that fits neither below nor above
+  // pinned it over its own bar, so the bar could not be clicked while hovered.
+  const below = vh - barRect.bottom - 2 * pad;
+  const above = barRect.top - 2 * pad;
+  let top: number;
+  if (below >= maxH) {
+    top = barRect.bottom + pad;
+  } else if (above >= maxH) {
+    top = barRect.top - maxH - pad;
+  } else if (Math.max(below, above) >= MIN_H) {
+    maxH = Math.max(below, above);
+    top = below >= above ? barRect.bottom + pad : pad;
+  } else {
+    top = Math.max(pad, Math.min(barRect.top, vh - maxH - pad));
+    left = barRect.right + pad + W <= vw - pad ? barRect.right + pad : Math.max(pad, barRect.left - W - pad);
+  }
 
   const isErr = span.status === "ERROR";
   const type = spanTypeInfo(span);
@@ -105,6 +119,7 @@ function SpanTooltip({
 
   return (
     <div
+      data-span-tooltip
       className="fixed z-[9999] rounded-lg shadow-2xl overflow-hidden flex flex-col pointer-events-auto"
       style={{
         left,
