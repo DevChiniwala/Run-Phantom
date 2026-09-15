@@ -20,7 +20,7 @@ export interface AgentConnectionStatus {
 }
 
 export async function getAgents(): Promise<AgentsRegistry> {
-  return apiJsonOrNull<AgentsRegistry>("/api/agents").then((agents) => agents ?? {});
+  return apiJson<AgentsRegistry>("/api/agents");
 }
 
 export async function getAgentsHealth(): Promise<AgentsHealth> {

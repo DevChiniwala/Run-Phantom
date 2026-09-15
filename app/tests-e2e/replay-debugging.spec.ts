@@ -7,6 +7,68 @@ async function exported(request: APIRequestContext, url: string, runId: string) 
   return response.json();
 }
 
+test("local replay: pending agent registry blocks replay entry points until configuration arrives", async ({ page, runPhantom, localReplayAgent }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/agents", async (route) => {
+    const response = await route.fetch();
+    await gate;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.goto(`${runPhantom.url}/runs/${SOURCE_RUN_ID}`);
+    await expect(page.getByRole("button", { name: "Replay", exact: true })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Replay with options", exact: true })).toBeDisabled();
+    await page.getByRole("button", { name: "Edit message and replay run", exact: true }).click();
+    const edit = page.getByRole("dialog", { name: "Edit & Replay", exact: true });
+    await expect(edit.getByRole("status")).toHaveText("Checking agent replay setup…");
+    await expect(edit.getByRole("button", { name: "Replay", exact: true })).toBeDisabled();
+    await expect(page.getByRole("dialog", { name: "Set Up Agent Replay", exact: true })).toHaveCount(0);
+    await edit.getByRole("button", { name: "Cancel", exact: true }).click();
+    expect(localReplayAgent.requests).toHaveLength(0);
+
+    release();
+    await expect(page.getByRole("button", { name: "Replay", exact: true })).toBeEnabled();
+    await page.getByRole("button", { name: "Replay with options", exact: true }).click();
+    await page.getByRole("dialog", { name: "Replay options", exact: true }).getByRole("button", { name: "Replay", exact: true }).click();
+    await expect(page.getByText(REPLAY_OUTPUT, { exact: true }).first()).toBeVisible();
+    expect(localReplayAgent.requests).toHaveLength(1);
+  } finally { release(); }
+});
+
+test("local replay: agent registry failures remain retryable without opening setup", async ({ page, runPhantom, localReplayAgent }) => {
+  let fail = true;
+  await page.route("**/api/agents", async (route) => {
+    if (!fail) return route.continue();
+    await route.fulfill({ status: 503, json: { error: "Registry temporarily unavailable" } });
+  });
+  await page.goto(`${runPhantom.url}/runs/${SOURCE_RUN_ID}`);
+  await expect(page.getByRole("alert").filter({ hasText: "Could not load agent replay setup." })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Replay", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Replay with options", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "Edit message and replay run", exact: true }).click();
+  const edit = page.getByRole("dialog", { name: "Edit & Replay", exact: true });
+  await expect(edit.getByRole("alert")).toContainText("Could not load agent replay setup.");
+  await expect(edit.getByRole("button", { name: "Replay", exact: true })).toBeDisabled();
+  await expect(page.getByRole("dialog", { name: "Set Up Agent Replay", exact: true })).toHaveCount(0);
+  expect(localReplayAgent.requests).toHaveLength(0);
+
+  fail = false;
+  await edit.getByRole("button", { name: "Retry agent replay setup", exact: true }).click();
+  await expect(edit.getByRole("button", { name: "Replay", exact: true })).toBeEnabled();
+  await edit.getByRole("button", { name: "Replay", exact: true }).click();
+  await expect(page.getByText(REPLAY_OUTPUT, { exact: true }).first()).toBeVisible();
+  expect(localReplayAgent.requests).toHaveLength(1);
+});
+
+test("local replay: a successful empty agent registry still offers setup", async ({ page, runPhantom, localReplayAgent }) => {
+  await page.route("**/api/agents", (route) => route.fulfill({ json: {} }));
+  await page.goto(`${runPhantom.url}/runs/${SOURCE_RUN_ID}`);
+  await page.getByRole("button", { name: "Replay", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Set Up Agent Replay", exact: true })).toBeVisible();
+  expect(localReplayAgent.requests).toHaveLength(0);
+});
+
 test("local replay: inspect a failure, edit the input, execute the registered fixture and compare persisted evidence", async ({ page, request, runPhantom, localReplayAgent }) => {
   const original = await exported(request, runPhantom.url, SOURCE_RUN_ID);
   await page.goto(`${runPhantom.url}/runs/${SOURCE_RUN_ID}`);

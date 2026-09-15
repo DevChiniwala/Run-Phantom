@@ -508,6 +508,20 @@ function annotationToSavedPreview(annotation: Annotation): SavedAnnotationPrevie
   };
 }
 
+function ReplayRegistryNotice({ status, onRetry }: {
+  status: "pending" | "error";
+  onRetry: () => Promise<void>;
+}) {
+  return (
+    <div role={status === "pending" ? "status" : "alert"} className="text-[11px]" style={{ color: status === "error" ? C.red : C.fg1 }}>
+      {status === "pending" ? "Checking agent replay setup…" : <>
+        Could not load agent replay setup.{" "}
+        <button type="button" aria-label="Retry agent replay setup" className="underline" onClick={() => { void onRetry(); }}>Retry</button>
+      </>}
+    </div>
+  );
+}
+
 function ViewHeader({
   title, model, active, stats, allSpans, startedAt, anthropicModels,
   run, isReplay, breadcrumb, fork, onAnnotateRun, annotationError, onDownload, deleteRedirectPath,
@@ -546,7 +560,7 @@ function ViewHeader({
   // Live registry lookup — re-renders whenever the server broadcasts
   // `agents_updated` (e.g. after the user runs `runphantom setup` or hits
   // `/api/agents/refresh`).
-  const { configured: agentConfigured } = useAgentForEvent(run?.event_name);
+  const { configured: agentConfigured, registryStatus: agentRegistryStatus, refetch: refetchAgents } = useAgentForEvent(run?.event_name);
   const forkMode = "local" as const;
   const [setupModalOpen, setSetupModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(() => run ? isEventSaved(run.id) : false);
@@ -791,12 +805,14 @@ function ViewHeader({
                   return <>
                   <div className="rp-clipped-ring flex items-stretch rounded-md overflow-hidden" style={{ border: `1px solid var(--rp-ink-a10)` }}>
                     <button
-                      className="flex items-center gap-1.5 text-[11px] px-3 py-1 font-medium transition-colors rp-hover-wash"
+                      disabled={agentRegistryStatus !== "success"}
+                      className="flex items-center gap-1.5 text-[11px] px-3 py-1 font-medium transition-colors rp-hover-wash disabled:opacity-50"
                       style={{
                         color: C.fg3,
                         background: "var(--rp-ink-a06)",
                       }}
                       onClick={() => {
+                        if (agentRegistryStatus !== "success") return;
                         if (agentConfigured) {
                           onFork(undefined, forkMode, forkModel || undefined);
                         } else {
@@ -814,7 +830,8 @@ function ViewHeader({
                       aria-expanded={optionsOpen}
                       aria-controls={optionsOpen ? replayOptionsId : undefined}
                       aria-haspopup="dialog"
-                      className="flex items-center justify-center px-1.5 transition-colors rp-hover-wash"
+                      disabled={agentRegistryStatus !== "success"}
+                      className="flex items-center justify-center px-1.5 transition-colors rp-hover-wash disabled:opacity-50"
                       style={{ color: C.fg1, background: "var(--rp-ink-a06)", borderLeft: "1px solid var(--rp-ink-a10)" }}
                       onClick={() => {
                         setAnnotationPopoverOpen(false);
@@ -825,6 +842,7 @@ function ViewHeader({
                       <ChevronDown className="h-3.5 w-3.5" />
                     </button>
                   </div>
+                  {agentRegistryStatus !== "success" && <ReplayRegistryNotice status={agentRegistryStatus} onRetry={refetchAgents} />}
                   <SetupReplayModal
                     open={setupModalOpen}
                     onClose={() => setSetupModalOpen(false)}
@@ -844,7 +862,7 @@ function ViewHeader({
                         el.style.right = `${window.innerWidth - btn.right}px`;
                       }}
                       style={{ background: "var(--rp-surface)", border: "1px solid var(--rp-border)", boxShadow: "var(--rp-e3)", width: "min(384px, calc(100vw - 32px))" }}>
-                      {!agentConfigured && (
+                      {agentRegistryStatus === "success" && !agentConfigured && (
                         <LocalAgentSetupCTA eventName={run?.event_name ?? undefined} />
                       )}
                       <div>
@@ -897,13 +915,15 @@ function ViewHeader({
                         </div>
                       )}
                       <button
-                        className="w-full py-1.5 rounded text-[11px] font-medium transition-colors hover:brightness-110"
+                        disabled={agentRegistryStatus !== "success"}
+                        className="w-full py-1.5 rounded text-[11px] font-medium transition-colors hover:brightness-110 disabled:opacity-50"
                         style={{
                           background: "var(--rp-ink-a08)",
                           color: C.fg4,
                           border: `1px solid var(--rp-ink-a10)`,
                         }}
                         onClick={() => {
+                          if (agentRegistryStatus !== "success") return;
                           if (!agentConfigured) {
                             setOptionsOpen(false);
                             setSetupModalOpen(true);
@@ -959,7 +979,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
   // Live registry lookup; re-renders on `agents_updated` WS event, so the
   // modal reflects registry changes that happen while it's open (rare but
   // possible if the user runs the slash command in another window).
-  const { configured: agentConfigured } = useAgentForEvent(eventName);
+  const { configured: agentConfigured, registryStatus: agentRegistryStatus, refetch: refetchAgents } = useAgentForEvent(eventName);
   const [agentContext, setAgentContext] = useState<Record<string, string>>({});
   const [contextEdits, setContextEdits] = useState<Record<string, string>>({});
 
@@ -976,7 +996,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
     }).catch(() => {});
   }, [runId, eventName, agentConfigured]);
 
-  useDialogFocus(agentConfigured, dialogRef, onClose);
+  useDialogFocus(agentRegistryStatus !== "success" || agentConfigured, dialogRef, onClose);
   const modalModelOptions = useMemo(() => buildReplayModelOptions({
     selectedModel: mdl,
     runModel: model,
@@ -985,6 +1005,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
   }), [mdl, model, traceModelFromMetadata, anthropicModels]);
 
   const handleReplay = () => {
+    if (agentRegistryStatus !== "success" || !agentConfigured) return;
     const ctxOverrides = mode === "local" && Object.keys(contextEdits).length > 0
       ? Object.fromEntries(Object.entries(contextEdits).filter(([k, v]) => v !== String(agentContext[k] ?? "")))
       : undefined;
@@ -992,7 +1013,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
     onReplay(msg, mode, mdl || undefined, Object.keys(ctxOverrides ?? {}).length ? ctxOverrides : undefined);
   };
 
-  if (!agentConfigured) {
+  if (agentRegistryStatus === "success" && !agentConfigured) {
     return (
       <SetupReplayModal
         open={true}
@@ -1011,6 +1032,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
           border: "1px solid var(--rp-border)", boxShadow: "var(--rp-e4)",
         }}>
         <h2 id="edit-replay-title" className="text-[13px] font-semibold" style={{ color: C.fg3 }}>Edit &amp; Replay</h2>
+        {agentRegistryStatus !== "success" && <ReplayRegistryNotice status={agentRegistryStatus} onRetry={refetchAgents} />}
 
         <div>
           <div className="text-[10px] font-medium mb-1" style={{ color: C.fg0 }}>Model</div>
@@ -1073,7 +1095,8 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
             Cancel
           </button>
           <button
-            className="px-4 py-1.5 rounded-lg text-[11px] font-medium transition-colors hover:brightness-110"
+            disabled={agentRegistryStatus !== "success"}
+            className="px-4 py-1.5 rounded-lg text-[11px] font-medium transition-colors hover:brightness-110 disabled:opacity-50"
             style={{
               color: C.fg4,
               background: "var(--rp-ink-a10)",

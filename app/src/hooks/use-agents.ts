@@ -59,7 +59,8 @@ export function useAgents() {
     return healthQuery.data ?? {};
   }, [agents, healthQuery.data, healthQuery.isLoading]);
 
-  return { agents, health, refetch };
+  const registryStatus = agentsQuery.isFetching ? "pending" : agentsQuery.status;
+  return { agents, health, refetch, registryStatus };
 }
 
 /**
@@ -70,7 +71,7 @@ export function useAgents() {
  * can pass `run.event_name` directly.
  */
 export function useAgentForEvent(eventName: string | null | undefined) {
-  const { agents, health, refetch } = useAgents();
+  const { agents, health, refetch, registryStatus } = useAgents();
   const name = (eventName ?? "").replace(/^replay:/, "");
   return {
     name,
@@ -78,6 +79,7 @@ export function useAgentForEvent(eventName: string | null | undefined) {
     configured: !!(name && agents[name]),
     online: !!(name && health[name] === "online"),
     refetch,
+    registryStatus,
   };
 }
 
