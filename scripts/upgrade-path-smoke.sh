@@ -6,18 +6,57 @@
 # existing user upgrades.
 #
 # Set RUNPHANTOM_BASELINE_BINARY to an executable baseline before running.
+# Set RUNPHANTOM_CANDIDATE_BINARY to reuse an already-built candidate.
 # The script assumes bun, curl, jq, and sqlite3 are available.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-5990}"
-TMP="$(mktemp -d)"
-DB="$TMP/upgrade.db"
-DAEMON_LOG="$HOME/.runphantom/runphantom.log"
-export RUNPHANTOM_DB_PATH="$DB"
-export PORT
-export RUNPHANTOM_PORT="$PORT"
+OLD_BIN="${RUNPHANTOM_BASELINE_BINARY:-}"
+NEW_BIN="${RUNPHANTOM_CANDIDATE_BINARY:-}"
+[ -n "$OLD_BIN" ] || { echo "::error::set RUNPHANTOM_BASELINE_BINARY to an executable baseline"; exit 2; }
+[ -x "$OLD_BIN" ] || { echo "::error::baseline is not executable: $OLD_BIN"; exit 2; }
+OLD_BIN="$(cd "$(dirname "$OLD_BIN")" && pwd -P)/$(basename "$OLD_BIN")"
+if [ -n "$NEW_BIN" ]; then
+  [ -x "$NEW_BIN" ] || { echo "::error::candidate is not executable: $NEW_BIN"; exit 2; }
+  NEW_BIN="$(cd "$(dirname "$NEW_BIN")" && pwd -P)/$(basename "$NEW_BIN")"
+fi
+
+# A TCP bind check also rejects occupied ports that do not serve HTTP. Check
+# before creating state or executing the baseline, and verify health PID later
+# to catch a different process taking the port between this check and startup.
+if ! bun -e '
+  const port = Number(process.argv[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(1);
+  const server = require("node:net").createServer();
+  server.once("error", () => process.exit(1));
+  server.listen({ port, host: "127.0.0.1", exclusive: true }, () => server.close());
+' "$PORT"; then
+  echo "::error::port $PORT is invalid or already in use"
+  exit 2
+fi
+
+# Resolve macOS /tmp aliases before using the secret-store path. Keep mktemp
+# separate from cd: a failed nested substitution must never select the checkout.
+TEST_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+TEST_ROOT="$(mktemp -d "$TEST_PARENT/runphantom-upgrade.XXXXXX")"
+case "$TEST_ROOT" in
+  "$TEST_PARENT"/runphantom-upgrade.??????) ;;
+  *) echo "::error::refusing unsafe temporary path: $TEST_ROOT"; exit 2 ;;
+esac
+[ -d "$TEST_ROOT" ] && [ ! -L "$TEST_ROOT" ] || { echo "::error::temporary directory is not a regular directory"; exit 2; }
+printf '%s\n' "$$" > "$TEST_ROOT/.upgrade-owned"
+DB="$TEST_ROOT/upgrade.db"
+DAEMON_LOG=""
+DAEMON_PID=""
+
+isolated_runtime() {
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TEST_ROOT" \
+    RUNPHANTOM_PORT="$PORT" RUNPHANTOM_BIND_HOST=127.0.0.1 \
+    RUNPHANTOM_DB_PATH="$DB" RUNPHANTOM_SECRET_STORE_PATH="$TEST_ROOT/secrets.json" \
+    RUNPHANTOM_CLAUDE_CLI_CHAT=0 "$@"
+}
 
 log_size() { [ -f "$DAEMON_LOG" ] && wc -c < "$DAEMON_LOG" | tr -d ' ' || echo 0; }
 log_since() {
@@ -27,49 +66,77 @@ log_since() {
   tail -c "$((now - before))" "$DAEMON_LOG"
 }
 
-# Poll /health until the daemon responds or the deadline elapses. Stable
-# binaries' built-in `runphantom start` boot wait is short enough that a
-# cold first-boot (sqlite migration replay + bun imports) can race past
-# it on ubuntu-latest under load — poll independently so the smoke test
-# doesn't depend on the binary's exit code.
 wait_for_health() {
   local port="$1"
   local timeout_s="${2:-60}"
   local deadline=$((SECONDS + timeout_s))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    curl -fsS "http://localhost:$port/health" >/dev/null 2>&1 && return 0
+    kill -0 "$DAEMON_PID" 2>/dev/null || return 1
+    if curl --noproxy '*' --max-time 1 -fsS "http://127.0.0.1:$port/health" 2>/dev/null |
+      jq -e --argjson expected "$DAEMON_PID" '.pid == $expected' >/dev/null 2>&1; then
+      kill -0 "$DAEMON_PID" 2>/dev/null && return 0
+    fi
     sleep 0.5
   done
   return 1
 }
 
+stop_owned_daemon() {
+  local pid="$DAEMON_PID"
+  DAEMON_PID=""
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..50}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+start_owned_daemon() {
+  local binary="$1"
+  DAEMON_LOG="$2"
+  (
+    cd "$TEST_ROOT"
+    exec env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TEST_ROOT" \
+      RUNPHANTOM_PORT="$PORT" RUNPHANTOM_BIND_HOST=127.0.0.1 \
+      RUNPHANTOM_DB_PATH="$DB" RUNPHANTOM_SECRET_STORE_PATH="$TEST_ROOT/secrets.json" \
+      RUNPHANTOM_CLAUDE_CLI_CHAT=0 "$binary" serve
+  ) > "$DAEMON_LOG" 2>&1 &
+  DAEMON_PID=$!
+}
+
 cleanup() {
+  local status=$?
   set +e
-  [ -n "${OLD_BIN:-}" ] && [ -x "$OLD_BIN" ] && "$OLD_BIN" stop >/dev/null 2>&1
-  [ -n "${NEW_BIN:-}" ] && [ -x "$NEW_BIN" ] && "$NEW_BIN" stop >/dev/null 2>&1
+  stop_owned_daemon
+  if [ "$status" -ne 0 ] && [ -n "$DAEMON_LOG" ] && [ -f "$DAEMON_LOG" ]; then tail -100 "$DAEMON_LOG" >&2; fi
+  if [ -d "$TEST_ROOT" ] && [ ! -L "$TEST_ROOT" ] && [ "$(cat "$TEST_ROOT/.upgrade-owned" 2>/dev/null)" = "$$" ]; then
+    rm -rf -- "$TEST_ROOT"
+  fi
+  return "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "── 1/8 validate the explicit Run Phantom baseline"
-OLD_BIN="${RUNPHANTOM_BASELINE_BINARY:-}"
-[ -n "$OLD_BIN" ] || { echo "::error::set RUNPHANTOM_BASELINE_BINARY to an executable baseline"; exit 2; }
-[ -x "$OLD_BIN" ] || { echo "::error::baseline is not executable: $OLD_BIN"; exit 2; }
-OLD_VER="$("$OLD_BIN" --version 2>&1 | head -1)"
+OLD_VER="$(isolated_runtime "$OLD_BIN" --version 2>&1)"
+OLD_VER="${OLD_VER%%$'\n'*}"
 echo "   stable = $OLD_VER"
 
 echo "── 2/8 boot stable against $DB on :$PORT"
-# The daemon is detached and `child.unref`'d — it keeps coming up even when
-# `runphantom start` reports a boot-wait timeout. `wait_for_health` is the
-# source of truth for readiness.
-"$OLD_BIN" start || true
+start_owned_daemon "$OLD_BIN" "$TEST_ROOT/baseline.log"
 wait_for_health "$PORT" 60 || {
   echo "::error::stable daemon did not respond on :$PORT within 60s"
-  [ -f "$DAEMON_LOG" ] && tail -200 "$DAEMON_LOG"
   exit 1
 }
 
 echo "── 3/8 seed fixtures via OTLP"
-RUNPHANTOM_URL="http://localhost:$PORT" bun "$REPO_ROOT/scripts/seed-traces.ts"
+isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" bun "$REPO_ROOT/scripts/seed-traces.ts"
 
 # Pinned trace ID for fixture 1 (`fixtureSuccessfulEdit`, salt=0). Used below
 # to assert per-row data survives migration, not just aggregate row count —
@@ -78,16 +145,16 @@ RUNPHANTOM_URL="http://localhost:$PORT" bun "$REPO_ROOT/scripts/seed-traces.ts"
 FIXTURE_RUN_ID="00000000000000000000000000000001"
 
 echo "── 4/8 snapshot run count + fixture outline under stable"
-OLD_RUNS="$(curl -fsS "http://localhost:$PORT/api/runs?limit=5000" | jq 'length')"
+OLD_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
 echo "   $OLD_RUNS runs persisted"
 [ "$OLD_RUNS" -ge 3 ] || { echo "::error::expected ≥3 seeded runs, got $OLD_RUNS"; exit 1; }
-OLD_OUTLINE="$(curl -fsS "http://localhost:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
+OLD_OUTLINE="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
 OLD_EVENT_NAME="$(printf '%s' "$OLD_OUTLINE" | jq -r '.run.event_name // empty')"
 OLD_SPAN_COUNT="$(printf '%s' "$OLD_OUTLINE" | jq '.spans | length')"
 [ -n "$OLD_EVENT_NAME" ] || { echo "::error::stable did not return event_name for $FIXTURE_RUN_ID"; exit 1; }
 [ "$OLD_SPAN_COUNT" -gt 0 ] || { echo "::error::stable returned 0 spans for $FIXTURE_RUN_ID"; exit 1; }
 echo "   fixture run: event_name=$OLD_EVENT_NAME spans=$OLD_SPAN_COUNT"
-"$OLD_BIN" stop
+stop_owned_daemon
 
 # Direct DB introspection under stable: the API returns previews of
 # payload columns and hides the migrations journal. Open the sqlite
@@ -110,28 +177,30 @@ OLD_INPUT_PAYLOAD="$(sqlite3 "$DB" "SELECT input_payload FROM spans WHERE run_id
 OLD_TABLES="$(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" | tr '\n' ',')"
 echo "   migrations=$OLD_MIGRATION_COUNT  payload_bytes=${#OLD_INPUT_PAYLOAD}  tables=$OLD_TABLES"
 
-echo "── 5/8 build PR's binary"
-( cd "$REPO_ROOT" && bun scripts/build-bun.ts >/dev/null )
-HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "x86_64" ] && HOST_ARCH="x64"; [ "$HOST_ARCH" = "aarch64" ] && HOST_ARCH="arm64"
-NEW_BIN="$REPO_ROOT/build/bun/runphantom-bun-${HOST_OS}-${HOST_ARCH}"
+echo "── 5/8 prepare PR's binary"
+if [ -z "$NEW_BIN" ]; then
+  ( cd "$REPO_ROOT" && bun scripts/build-bun.ts >/dev/null )
+  HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "x86_64" ] && HOST_ARCH="x64"; [ "$HOST_ARCH" = "aarch64" ] && HOST_ARCH="arm64"
+  NEW_BIN="$REPO_ROOT/build/bun/runphantom-bun-${HOST_OS}-${HOST_ARCH}"
+fi
 [ -x "$NEW_BIN" ] || { echo "::error::build did not produce $NEW_BIN"; exit 1; }
-NEW_VER="$("$NEW_BIN" --version 2>&1 | head -1)"
+NEW_VER="$(isolated_runtime "$NEW_BIN" --version 2>&1)"
+NEW_VER="${NEW_VER%%$'\n'*}"
 echo "   PR     = $NEW_VER"
 if [ "$OLD_VER" = "$NEW_VER" ]; then
   echo "::warning::stable and PR report the same version — upgrade-path test only validates re-open of an unchanged schema"
 fi
 
 echo "── 6/8 boot PR binary against the SAME db"
-"$NEW_BIN" start || true
+start_owned_daemon "$NEW_BIN" "$TEST_ROOT/candidate.log"
 wait_for_health "$PORT" 60 || {
   echo "::error::PR daemon did not respond on :$PORT within 60s"
-  [ -f "$DAEMON_LOG" ] && tail -200 "$DAEMON_LOG"
   exit 1
 }
 
 echo "── 7/8 verify migration preserved data"
-NEW_RUNS="$(curl -fsS "http://localhost:$PORT/api/runs?limit=5000" | jq 'length')"
+NEW_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
 echo "   $NEW_RUNS runs survive migration"
 [ "$NEW_RUNS" -ge "$OLD_RUNS" ] || {
   echo "::error::data loss after upgrade: $OLD_RUNS → $NEW_RUNS"
@@ -140,7 +209,7 @@ echo "   $NEW_RUNS runs survive migration"
 # Per-row check: fetch the same fixture run and assert its event_name +
 # span count survive. Aggregate count check alone misses migrations that
 # drop columns, truncate payloads, or rename event_name.
-NEW_OUTLINE="$(curl -fsS "http://localhost:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
+NEW_OUTLINE="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
 NEW_EVENT_NAME="$(printf '%s' "$NEW_OUTLINE" | jq -r '.run.event_name // empty')"
 NEW_SPAN_COUNT="$(printf '%s' "$NEW_OUTLINE" | jq '.spans | length')"
 if [ "$NEW_EVENT_NAME" != "$OLD_EVENT_NAME" ]; then
@@ -207,11 +276,11 @@ echo "── 8/8 seed fresh traces under PR binary, verify writes accepted + no 
 LOG_BEFORE_WRITE="$(log_size)"
 # Salt the trace IDs so the second seed produces distinct rows instead of
 # upserting the originals — the strict-greater check below depends on it.
-RUNPHANTOM_URL="http://localhost:$PORT" RUNPHANTOM_SEED_SALT=1000 \
+isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" RUNPHANTOM_SEED_SALT=1000 \
   bun "$REPO_ROOT/scripts/seed-traces.ts"
 # Daemon flushes spans + partial events on a short interval; give it room.
 sleep 2
-FINAL_RUNS="$(curl -fsS "http://localhost:$PORT/api/runs?limit=5000" | jq 'length')"
+FINAL_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
 echo "   $FINAL_RUNS runs after fresh seed"
 [ "$FINAL_RUNS" -gt "$NEW_RUNS" ] || {
   echo "::error::PR binary did not accept new writes: $NEW_RUNS → $FINAL_RUNS"

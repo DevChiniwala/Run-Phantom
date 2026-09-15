@@ -197,6 +197,12 @@ function createReplayAbortLifecycle(req: express.Request, res: express.Response)
 }
 
 const DEMO_CHAT_MODEL = process.env.RUNPHANTOM_DEMO_CHAT_MODEL ?? "gpt-5.6-luna";
+const DEMO_CHAT_TIMEOUT_MS = 60_000;
+const DEMO_CHAT_MAX_FRAME_BYTES = 128 * 1024;
+const DEMO_CHAT_MAX_STREAM_BYTES = 1024 * 1024;
+const DEMO_CHAT_MAX_OUTPUT_BYTES = 64 * 1024;
+
+class DemoChatStreamError extends Error {}
 
 type DemoChatMessage = {
   role: "system" | "user" | "assistant";
@@ -221,23 +227,6 @@ function parseDemoMessages(value: unknown): DemoChatMessage[] | null {
   return messages.some((message) => message.role === "user") ? messages : null;
 }
 
-function extractOpenAiTextDelta(payload: any): string {
-  if (!payload || typeof payload !== "object") return "";
-  // Responses API streaming emits incremental `*.delta` events AND a terminal
-  // `*.done`/`response.completed` event that repeats the FULL accumulated text
-  // in `text`. Keying off the event type prevents appending that final full
-  // text a second time, which previously duplicated the whole reply.
-  if (typeof payload.type === "string") {
-    if (payload.type.endsWith(".delta")) return typeof payload.delta === "string" ? payload.delta : "";
-    if (payload.type.endsWith(".done") || payload.type.endsWith(".completed")) return "";
-  }
-  if (typeof payload.delta === "string") return payload.delta;
-  if (typeof payload.text === "string") return payload.text;
-  const chatDelta = payload.choices?.[0]?.delta?.content;
-  if (typeof chatDelta === "string") return chatDelta;
-  return "";
-}
-
 async function streamOpenAiDemoChat(req: express.Request, res: express.Response): Promise<void> {
   const messages = parseDemoMessages((req.body as Record<string, unknown> | null)?.messages);
   if (!messages) {
@@ -251,69 +240,113 @@ async function streamOpenAiDemoChat(req: express.Request, res: express.Response)
     return;
   }
 
-  const upstream = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: DEMO_CHAT_MODEL,
-      instructions:
-        "You are the tiny Run Phantom demo bot. Be warm, concise, and explain how Run Phantom helps debug AI agents with local traces.",
-      input: messages.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-      stream: true,
-    }),
-  });
-
-  if (!upstream.ok) {
-    const text = await upstream.text().catch(() => "");
-    res.status(upstream.status).json({ error: text || `OpenAI request failed (${upstream.status})` });
-    return;
-  }
-
-  const reader = (upstream.body as any)?.getReader?.();
-  if (!reader) {
-    res.status(502).json({ error: "OpenAI response did not include a readable stream." });
-    return;
-  }
-
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("X-Accel-Buffering", "no");
-
-  const decoder = new TextDecoder();
+  const lifecycle = createReplayAbortLifecycle(req, res);
+  const { controller } = lifecycle;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const cancelReader = () => { void reader?.cancel().catch(() => undefined); };
+  controller.signal.addEventListener("abort", cancelReader, { once: true });
+  const timeout = setTimeout(() => controller.abort(new DemoChatStreamError("Demo request timed out. Please try again.")), DEMO_CHAT_TIMEOUT_MS);
+  timeout.unref();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
+  let streamBytes = 0;
+  let outputBytes = 0;
+  const writeEvent = (event: { type: "delta"; delta: string } | { type: "complete" } | { type: "error"; error: string }) => {
+    if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(event)}\n`);
+  };
+
   try {
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      redirect: "error",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: DEMO_CHAT_MODEL,
+        instructions:
+          "You are the tiny Run Phantom demo bot. Be warm, concise, and explain how Run Phantom helps debug AI agents with local traces.",
+        input: messages.map((message) => ({ role: message.role, content: message.content })),
+        stream: true,
+        max_output_tokens: 4096,
+      }),
+    });
+    reader = upstream.body?.getReader();
+    controller.signal.throwIfAborted();
+    if (!upstream.ok) {
+      res.status(upstream.status).json({ error: `OpenAI request failed (${upstream.status}). Please try again.` });
+      return;
+    }
+    if (!reader) throw new DemoChatStreamError("OpenAI response did not include a readable stream.");
+
+    // This private demo transport carries an explicit terminal record so a clean
+    // downstream EOF cannot turn an interrupted reply into completed history.
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      controller.signal.throwIfAborted();
+      if (done) throw new DemoChatStreamError("OpenAI stream ended before the reply completed. Please try again.");
+      streamBytes += value.byteLength;
+      if (streamBytes > DEMO_CHAT_MAX_STREAM_BYTES) throw new DemoChatStreamError("OpenAI stream exceeded the size limit.");
       buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? "";
-      for (const frame of frames) {
-        const dataLines = frame
-          .split("\n")
+      let boundary: RegExpExecArray | null;
+      while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        if (Buffer.byteLength(frame) > DEMO_CHAT_MAX_FRAME_BYTES) throw new DemoChatStreamError("OpenAI stream frame exceeded the size limit.");
+        const data = frame.split(/\r?\n/)
           .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trim());
-        for (const data of dataLines) {
-          if (!data || data === "[DONE]") continue;
-          try {
-            const payload = JSON.parse(data);
-            const delta = extractOpenAiTextDelta(payload);
-            if (delta) res.write(delta);
-          } catch {
-            /* Ignore non-JSON stream control frames. */
+          .map((line) => line.slice(5).trimStart()).join("\n");
+        if (!data) continue;
+        if (data === "[DONE]") throw new DemoChatStreamError("OpenAI stream ended before the reply completed. Please try again.");
+        const payload = JSON.parse(data);
+        if (!payload || typeof payload !== "object" || typeof payload.type !== "string") {
+          throw new DemoChatStreamError("OpenAI returned a malformed stream event.");
+        }
+        if (["response.failed", "response.incomplete", "response.cancelled", "error"].includes(payload.type)) {
+          throw new DemoChatStreamError(payload.type === "response.incomplete"
+            ? "OpenAI could not finish the reply. Please try again."
+            : "OpenAI failed to complete the reply. Please try again.");
+        }
+        if (payload.type === "response.completed") {
+          if (payload.response?.status !== "completed" || payload.response.error || payload.response.incomplete_details) {
+            throw new DemoChatStreamError("OpenAI did not confirm a successful reply.");
           }
+          writeEvent({ type: "complete" });
+          res.end();
+          return;
+        }
+        // Done events repeat the full text, and other delta types may contain
+        // reasoning or tool arguments that do not belong in the visible reply.
+        if (payload.type === "response.output_text.delta" || payload.type === "response.refusal.delta") {
+          if (typeof payload.delta !== "string") throw new DemoChatStreamError("OpenAI returned a malformed text delta.");
+          outputBytes += Buffer.byteLength(payload.delta);
+          if (outputBytes > DEMO_CHAT_MAX_OUTPUT_BYTES) throw new DemoChatStreamError("OpenAI reply exceeded the size limit.");
+          if (payload.delta) writeEvent({ type: "delta", delta: payload.delta });
         }
       }
+      if (Buffer.byteLength(buffer) > DEMO_CHAT_MAX_FRAME_BYTES) throw new DemoChatStreamError("OpenAI stream frame exceeded the size limit.");
+    }
+  } catch (err) {
+    if (res.writableEnded || res.destroyed) return;
+    const failure = controller.signal.aborted ? controller.signal.reason : err;
+    const error = failure instanceof DemoChatStreamError ? failure.message : "OpenAI stream failed. Please try again.";
+    if (!res.headersSent) res.status(502).type("json").json({ error });
+    else {
+      writeEvent({ type: "error", error });
+      res.end();
     }
   } finally {
-    try { await reader.cancel?.(); } catch {}
-    res.end();
+    clearTimeout(timeout);
+    lifecycle.cleanup();
+    controller.abort();
+    cancelReader();
+    controller.signal.removeEventListener("abort", cancelReader);
   }
 }
 
@@ -586,13 +619,15 @@ function demoChatHtml(): string {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const text = input.value.trim();
-      if (!text) return;
+      if (!text || send.disabled) return;
       input.value = "";
       send.disabled = true;
       status.textContent = "Running...";
       messages.push({ role: "user", content: text });
       add("user", text);
       const assistant = add("assistant", "");
+      let reply = "";
+      let reader;
       try {
         const res = await fetch("/api/demo-chat", {
           method: "POST",
@@ -602,26 +637,45 @@ function demoChatHtml(): string {
           body: JSON.stringify({ messages }),
         });
         if (!res.ok || !res.body) {
-          const err = await res.text();
-          throw new Error(err || "Demo request failed.");
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || "Demo request failed.");
         }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let reply = "";
-        while (true) {
+        reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        let buffer = "";
+        let completed = false;
+        while (!completed) {
           const { done, value } = await reader.read();
           if (done) break;
-          reply += decoder.decode(value, { stream: true });
-          assistant.textContent = reply || "…";
-          log.scrollTop = log.scrollHeight;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary;
+          while ((boundary = buffer.indexOf("\\n")) !== -1) {
+            const line = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 1);
+            const event = JSON.parse(line);
+            if (event.type === "error") throw new Error(event.error || "Demo request failed.");
+            if (event.type === "complete") {
+              completed = true;
+              break;
+            }
+            if (event.type !== "delta" || typeof event.delta !== "string") throw new Error("Invalid demo reply.");
+            reply += event.delta;
+            assistant.textContent = reply || "…";
+            log.scrollTop = log.scrollHeight;
+          }
         }
+        if (!completed) throw new Error("Reply interrupted before completion. Please try again.");
         messages.push({ role: "assistant", content: reply });
         status.textContent = "Reply complete.";
       } catch (err) {
-        assistant.remove();
+        if (reply) {
+          assistant.classList.add("error");
+          assistant.setAttribute("aria-label", "Incomplete assistant reply");
+        } else assistant.remove();
         add("error", err instanceof Error ? err.message : String(err));
         status.textContent = "Request failed.";
       } finally {
+        if (reader) void reader.cancel().catch(() => {});
         send.disabled = false;
         input.focus();
       }
@@ -987,12 +1041,12 @@ export async function createServer(port: number) {
   app.post("/api/demo-chat", (req, res) => {
     streamOpenAiDemoChat(req, res).catch((err) => {
       console.error("[runphantom] demo chat error:", err);
+      if (res.writableEnded || res.destroyed) return;
       if (!res.headersSent) {
-        res.status(500).json({ error: (err as Error).message || "Demo chat failed." });
+        res.status(500).json({ error: "Demo chat failed." });
         return;
       }
-      res.write(`\n[demo chat error: ${(err as Error).message || String(err)}]`);
-      res.end();
+      res.destroy();
     });
   });
 

@@ -30,7 +30,7 @@ export const evaluationsApi = {
     if (!response.ok) { const body = await response.json().catch(() => null); throw new Error(typeof body?.error === "string" ? body.error : "Could not export evaluation report."); }
     return response.blob();
   },
-  cancel: (id: string) => apiJson<Experiment>(`${experimentPath(id)}/cancel`, jsonInit("POST")),
+  cancel: (id: string) => apiJson<Experiment>(`${experimentPath(id)}/cancel`, { method: "POST" }),
   compare: (baseline: string, candidate: string) => apiJson<Comparison>(`${root}/compare?${new URLSearchParams({ baseline, candidate })}`),
   reviews: (id: string) => apiJson<Review[]>(`${experimentPath(id)}/reviews`),
   review: (id: string, caseId: string, rating: "pass" | "fail", note: string) => apiJson<Review>(`${experimentPath(id)}/reviews`, jsonInit("POST", { caseId, rating, note })),

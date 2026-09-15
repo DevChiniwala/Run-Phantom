@@ -30,14 +30,18 @@ test("live providers: saving a synthetic run in the UI persists an Anthropic sum
   await seedRunPhantomFixtures(liveUrl!);
   const configured = await request.get(`${liveUrl}/api/secrets`);
   expect((await configured.json()).keys.anthropic.configured).toBe(true);
+  const savedFixtureUrl = `${liveUrl}/api/saved-runs/events/${FIXTURE_PRIMARY_RUN_ID}`;
+  expect((await request.delete(savedFixtureUrl)).status()).toBe(200);
+  expect((await request.get(savedFixtureUrl)).status()).toBe(404);
   await page.goto(`${liveUrl}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+  await expect(page.getByRole("button", { name: "Save", exact: true })).toBeVisible();
   const summaryResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/summarize", { timeout: 120_000 });
   await page.getByRole("button", { name: "Save", exact: true }).click();
   const result = await (await summaryResponse).json();
   expect(typeof result.summary).toBe("string");
   expect(result.summary?.length).toBeGreaterThan(10);
   await expect.poll(async () => {
-    const response = await request.get(`${liveUrl}/api/saved-runs/events/${FIXTURE_PRIMARY_RUN_ID}`);
+    const response = await request.get(savedFixtureUrl);
     const saved = await response.json();
     return saved.event?.summary === result.summary;
   }, { timeout: 10_000 }).toBe(true);
@@ -130,7 +134,9 @@ test("live providers: cancelling model grading in the UI retains an interrupted 
   const response = await admitted;
   expect(response.status()).toBe(202);
   const initial = await response.json() as Experiment;
+  const cancellation = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === `/api/evaluations/experiments/${initial.id}/cancel`);
   await page.getByRole("button", { name: "Cancel experiment", exact: true }).click();
+  expect((await cancellation).status()).toBe(200);
   await expect.poll(async () => {
     const current = await request.get(`${liveUrl}/api/evaluations/experiments/${initial.id}`);
     return (await current.json() as Experiment).status;

@@ -212,6 +212,39 @@ test("Run Phantom UI: run header actions never cover the run title or status", a
   }
 });
 
+test("Run Phantom UI: trajectory renders when the first spans arrive after live activity", async ({ page, request, runPhantom }) => {
+  await seedRunPhantomFixtures(runPhantom.url);
+  const detailUrl = `${runPhantom.url}/api/runs/detail/${FIXTURE_PRIMARY_RUN_ID}`;
+  const detail = await (await request.get(detailUrl)).json();
+  const expectedBars = detail.spans.filter((span: { span_type: string | null }) =>
+    span.span_type === "TRACE" || span.span_type === "TOOL_CALL" || span.span_type?.includes("LLM"),
+  ).length;
+  expect(expectedBars).toBeGreaterThan(0);
+
+  let spansArrived = false;
+  const activity = "Waiting for the first completed span.";
+  await page.route(detailUrl, async (route) => {
+    if (spansArrived) return route.continue();
+    await route.fulfill({ json: {
+      ...detail,
+      spans: [],
+      subAgents: [],
+      liveEvents: [{ id: 1, trace_id: FIXTURE_PRIMARY_RUN_ID, span_id: null, type: "reasoning",
+        content: activity, timestamp: detail.run.started_at, metadata: null }],
+    } });
+  });
+  await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+  await expect(page.getByText(activity, { exact: true })).toBeVisible();
+  const bars = page.locator('button.timeline-bar, button[aria-label^="Jump to "]');
+  await expect(bars).toHaveCount(0);
+
+  // Ingesting the completed spans refreshes the already-mounted overview over
+  // its real WebSocket, without a navigation or remount hiding the transition.
+  spansArrived = true;
+  await seedRunPhantomFixtures(runPhantom.url);
+  await expect(bars).toHaveCount(expectedBars);
+});
+
 test("Run Phantom UI: a trajectory tooltip never covers the bar it describes", async ({ page, runPhantom }) => {
   const replay = await fetch(`${runPhantom.url}/api/demo-traces/replay`, { method: "POST" });
   expect(replay.ok).toBe(true);
