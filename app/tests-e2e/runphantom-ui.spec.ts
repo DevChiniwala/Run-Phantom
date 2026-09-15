@@ -175,9 +175,10 @@ test("Run Phantom UI: span tree and side panel render the seeded trace", async (
 test("Run Phantom UI: download exports the selected trace as JSON", async ({ page, runPhantom }) => {
   await seedRunPhantomFixtures(runPhantom.url);
 
-  const detailResponse = await fetch(`${runPhantom.url}/api/runs/detail/${FIXTURE_PRIMARY_RUN_ID}`);
+  const detailResponse = await fetch(`${runPhantom.url}/api/runs/${FIXTURE_PRIMARY_RUN_ID}/export`);
   expect(detailResponse.ok).toBe(true);
   const expectedTrace = await detailResponse.json();
+  expect(expectedTrace.format).toBe("runphantom-trace/v1");
 
   await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
   const downloadButton = page.getByRole("button", { name: /^download$/i });

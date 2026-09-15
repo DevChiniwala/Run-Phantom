@@ -1,12 +1,13 @@
 /** Versioned evaluation contracts. Independent implementation of the documented research concepts. */
 export const EVALUATION_VERSION = 1 as const;
 export const SNAPSHOT_VERSION = 1 as const;
-export const UNAVAILABLE_EVIDENCE = /\[(?:REDACTED|TRUNCATED|UNSERIALIZABLE|CIRCULAR|UNAVAILABLE)\]/i;
+export const UNAVAILABLE_EVIDENCE = /\[(?:REDACTED|TRUNCATED|UNSERIALIZABLE|CIRCULAR|UNAVAILABLE)\]|__REDACTED__/i;
 export const EVALUATION_LIMITS = {
   MAX_SPANS: 5000, MAX_TRACE_DEPTH: 128, MAX_PAYLOAD_BYTES: 64 * 1024, MAX_ACQUIRED_PAYLOAD_BYTES: 32 * 1024 * 1024, MAX_DATASETS: 50, MAX_REVISIONS: 20,
   MAX_CASES: 50, MAX_RULES: 8, MAX_TAGS: 8, MAX_NAME: 128, MAX_EXPECTED: 4096,
   MAX_RUBRIC: 2000, MAX_NOTE: 2000, MAX_REQUEST: 2 * 1024 * 1024, MAX_SNAPSHOT: 64 * 1024,
   MAX_TEXT_BYTES: 16 * 1024, MAX_FROZEN_EXPERIMENT: 3 * 1024 * 1024, MAX_RESULT_BYTES: 2048,
+  MAX_TOOL_ARGUMENT_BYTES: 8 * 1024, MAX_TOOL_ARGUMENT_TOTAL_BYTES: 16 * 1024,
   MAX_EXPERIMENT: 4 * 1024 * 1024, MAX_EXPERIMENTS: 200, MAX_REVIEWS: 1000,
   MAX_ACTIVE_JOBS: 2, MAX_REASON: 512, MAX_JUDGE_RESPONSE_BYTES: 64 * 1024, JUDGE_TIMEOUT_MS: 30_000,
 } as const;
@@ -17,6 +18,7 @@ export type Rule =
   | { kind: "json" }
   | { kind: "jsonPath"; path: string; equals: unknown }
   | { kind: "tools"; operation: "required" | "forbidden" | "sequence"; names: string[] }
+  | { kind: "toolArgument"; name: string; path: string; equals: unknown; match: "any" | "all" }
   | { kind: "budget"; metric: BudgetMetric; max: number }
   | { kind: "errors"; max: number }
   | { kind: "rubric"; provider: "openai" | "anthropic"; model: string; rubric: string; threshold: number };
@@ -42,11 +44,16 @@ export interface SnapshotMetrics {
   inputTokens: number | null; outputTokens: number | null; totalTokens: number | null;
   durationMs: number | null; costUsd: number | null; toolCalls: number | null; errorSpans: number | null;
 }
+export interface ToolArgumentEvidence {
+  status: "available" | "missing" | "withheld" | "redacted" | "truncated" | "invalid" | "incomplete";
+  source: "inputPayload" | "adapterInput" | "runphantomInput" | null;
+  value: unknown;
+}
 export interface Snapshot {
   version: typeof SNAPSHOT_VERSION; runId: string; runName: string; capturedAt: number;
   complete: boolean; warnings: string[]; input: string | null;
   output: { value: string | null; spanId: string | null; source: "agentRoot" | "selected" | "terminalGeneration" | "unavailable"; complete: boolean };
-  tools: Array<{ spanId: string; name: string; startedAt: number | null; endedAt: number | null; error: boolean }>;
+  tools: Array<{ spanId: string; name: string; startedAt: number | null; endedAt: number | null; error: boolean; arguments?: ToolArgumentEvidence }>;
   toolsComplete: boolean; metrics: SnapshotMetrics;
   models: Array<{ provider: string; model: string; requests: number; errorSpans: number | null; inputTokens: number | null; outputTokens: number | null; costUsd: number | null }>;
   redacted: boolean; truncated: boolean;

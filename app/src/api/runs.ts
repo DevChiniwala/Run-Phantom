@@ -19,8 +19,32 @@ export async function listRuns(): Promise<Run[]> {
   return apiJson<Run[]>("/api/runs");
 }
 
-export async function getRunDetail(runId: string): Promise<RunDetailData> {
-  return apiJson<RunDetailData>(`/api/runs/detail/${encodeURIComponent(runId)}`);
+export interface RunSearchOptions {
+  q?: string;
+  status?: string;
+  model?: string;
+  provider?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface RunSearchResult {
+  runs: Run[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  elapsedMs: number;
+}
+
+export async function searchRuns(options: RunSearchOptions, signal?: AbortSignal): Promise<RunSearchResult> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  }
+  return apiJson<RunSearchResult>(`/api/runs/search?${params}`, { signal });
+}
+
+export async function getRunDetail(runId: string, signal?: AbortSignal): Promise<RunDetailData> {
+  return apiJson<RunDetailData>(`/api/runs/detail/${encodeURIComponent(runId)}`, { signal });
 }
 
 export async function getRunDetailOrNull(runId: string): Promise<RunDetailData | null> {

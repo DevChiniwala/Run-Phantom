@@ -1176,7 +1176,8 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   const dataRef = useRef(data);
   const navigate = useNavigate();
   const { spanId: routeSpanId } = useParams<{ spanId?: string }>();
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
+  const searchQuery = routeBase === "/search" ? search : "";
   const usesRouteState = routeBase !== undefined;
   const runView = usesRouteState ? runViewFromPathname(pathname) : "overview";
   const tab: "chat" | "tree" | "convo" =
@@ -1222,28 +1223,28 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   }, []);
 
   const goOverview = useCallback(() => {
-    if (routeBase) navigate(tracePath(routeBase, runId));
+    if (routeBase) navigate(`${tracePath(routeBase, runId)}${searchQuery}`);
     else setLocalTab("chat");
-  }, [navigate, routeBase, runId]);
+  }, [navigate, routeBase, runId, searchQuery]);
   const goSpans = useCallback(() => {
-    if (routeBase) navigate(traceSpansPath(routeBase, runId));
+    if (routeBase) navigate(`${traceSpansPath(routeBase, runId)}${searchQuery}`);
     else setLocalTab("tree");
-  }, [navigate, routeBase, runId]);
+  }, [navigate, routeBase, runId, searchQuery]);
   const goConvo = useCallback(() => {
-    if (routeBase) navigate(traceConvoPath(routeBase, runId));
+    if (routeBase) navigate(`${traceConvoPath(routeBase, runId)}${searchQuery}`);
     else setLocalTab("convo");
-  }, [navigate, routeBase, runId]);
+  }, [navigate, routeBase, runId, searchQuery]);
   const selectSpan = useCallback(
     (spanId: string | null) => {
       if (routeBase) {
-        if (spanId) navigate(traceSpanPath(routeBase, runId, spanId));
-        else navigate(traceSpansPath(routeBase, runId));
+        if (spanId) navigate(`${traceSpanPath(routeBase, runId, spanId)}${searchQuery}`);
+        else navigate(`${traceSpansPath(routeBase, runId)}${searchQuery}`);
         return;
       }
       setLocalTab("tree");
       setLocalSelectedSpanId(spanId);
     },
-    [navigate, routeBase, runId],
+    [navigate, routeBase, runId, searchQuery],
   );
   const openConversationTurn = useCallback((id: string) => {
     if (routeBase === "/saved" && (id === runId || isEventSaved(id))) {
@@ -1260,7 +1261,7 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
       if (!spanId) return;
       const spans = dataRef.current?.spans;
       if (!spans?.some((s) => s.id === spanId)) return;
-      if (routeBase) navigate(traceSpanPath(routeBase, runId, spanId));
+      if (routeBase) navigate(`${traceSpanPath(routeBase, runId, spanId)}${searchQuery}`);
       else {
         setLocalTab("tree");
         setLocalSelectedSpanId(spanId);
@@ -1268,7 +1269,7 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
     };
     window.addEventListener("runphantom:deep-link-span", handler);
     return () => window.removeEventListener("runphantom:deep-link-span", handler);
-  }, [navigate, routeBase, runId]);
+  }, [navigate, routeBase, runId, searchQuery]);
   const [focusedAgent, setFocusedAgent] = useState<string | null>(null);
   const [editModal, setEditModal] = useState<{ userMessage: string } | null>(null);
 
@@ -1315,14 +1316,14 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   useEffect(() => {
     if (!routeBase || !selectedSpanId || !data?.spans.length) return;
     if (!data.spans.some((s) => s.id === selectedSpanId)) {
-      navigate(traceSpansPath(routeBase, runId), { replace: true });
+      navigate(`${traceSpansPath(routeBase, runId)}${searchQuery}`, { replace: true });
     }
-  }, [data?.spans, navigate, routeBase, runId, selectedSpanId]);
+  }, [data?.spans, navigate, routeBase, runId, searchQuery, selectedSpanId]);
 
   useEffect(() => {
     if (!routeBase || runView !== "convo" || !data?.run) return;
-    if (!data.run.convo_id) navigate(tracePath(routeBase, runId), { replace: true });
-  }, [data?.run, navigate, routeBase, runId, runView]);
+    if (!data.run.convo_id) navigate(`${tracePath(routeBase, runId)}${searchQuery}`, { replace: true });
+  }, [data?.run, navigate, routeBase, runId, runView, searchQuery]);
 
   useLayoutEffect(() => {
     stickToBottomContextRef.current?.stopScroll();
@@ -1492,15 +1493,22 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   const errs = spans.filter(s => s.status === "ERROR");
   const dur = run.last_updated_at - run.started_at;
   const model = spans.find(s => s.model)?.model;
-  const downloadTrace = () => {
-    const url = URL.createObjectURL(new Blob([
-      JSON.stringify({ ...data, liveEvents }, null, 2),
-    ], { type: "application/json" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `trace-${run.id}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+  const downloadTrace = async () => {
+    try {
+      const response = await fetch(`/api/runs/${encodeURIComponent(run.id)}/export`);
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null);
+        throw new Error(failure?.error || `Could not export trace (${response.status})`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `trace-${run.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Could not export trace");
+    }
   };
 
   const tabStyle = (k: string) => ({

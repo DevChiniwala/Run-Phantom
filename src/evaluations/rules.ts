@@ -3,9 +3,11 @@ import { redactText, sanitizeWithReport } from "../verification/serialization";
 import { selectPath } from "../verification/state-select";
 import { structurallyEqual } from "../verification/predicates";
 import { parseId } from "./validation";
+import { LossyJsonNumberError, parseJsonEvidence } from "./json-evidence";
 
-export const CODE_EVALUATOR_VERSION = "code:1";
+export const CODE_EVALUATOR_VERSION = "code:2";
 export const RUBRIC_EVALUATOR_VERSION = "rubric:1";
+export const TOOL_ARGUMENT_EVALUATOR_VERSION = "toolargs:1";
 const encoder = new TextEncoder();
 /** Bound untrusted evidence separately from the outcome metadata, which must retain its types. */
 export function boundRuleResult(result: RuleResult): RuleResult {
@@ -41,7 +43,7 @@ export function boundRuleResult(result: RuleResult): RuleResult {
 /** Evaluate only declarative local rules. Model rubrics are dispatched by the explicitly opted-in service. */
 export function evaluateRule(rule: Rule, snapshot: Snapshot): RuleResult {
   const make = (status: Status, reason: string, actual: unknown = null, expected: unknown = rule, spanIds: string[] = []): RuleResult =>
-    boundRuleResult({ status, source: "code", evaluatorVersion: CODE_EVALUATOR_VERSION, score: status === "pass" ? 1 : status === "fail" ? 0 : null,
+    boundRuleResult({ status, source: "code", evaluatorVersion: rule.kind === "toolArgument" ? TOOL_ARGUMENT_EVALUATOR_VERSION : CODE_EVALUATOR_VERSION, score: status === "pass" ? 1 : status === "fail" ? 0 : null,
       reason, actual, expected, spanIds, redacted: false, truncated: false });
   const unknown = (reason: string, actual: unknown = null) => make("inconclusive", reason, actual);
   if (rule.kind === "rubric") return unknown("Model rubric requires the opted-in model evaluator");
@@ -82,6 +84,33 @@ export function evaluateRule(rule: Rule, snapshot: Snapshot): RuleResult {
     }
     return make(pass ? "pass" : "fail", "Compared the recorded normalized tool calls with the declared requirement", names, rule.names, tools.map((tool) => tool.spanId));
   }
+  if (rule.kind === "toolArgument") {
+    const calls = snapshot.tools.filter((tool) => tool.name === rule.name);
+    let unavailable = !snapshot.toolsComplete;
+    const observations: Array<{ spanId: string; found: boolean; value: unknown }> = [];
+    for (const tool of calls) {
+      const evidence = tool.arguments;
+      if (evidence?.status !== "available" || evidence.source === null || tool.startedAt === null || tool.endedAt === null || tool.endedAt < tool.startedAt) {
+        unavailable = true; continue;
+      }
+      const serialized = JSON.stringify(evidence.value);
+      if (serialized === undefined || UNAVAILABLE_EVIDENCE.test(serialized)) { unavailable = true; continue; }
+      const selected = selectPath(evidence.value, rule.path);
+      const matches = selected.found && structurallyEqual(selected.value, rule.equals);
+      observations.push({ spanId: tool.spanId, found: selected.found, value: selected.value });
+      if (rule.match === "any" && matches || rule.match === "all" && !matches) {
+        return make(matches ? "pass" : "fail", matches ? "At least one captured tool call has the declared argument value"
+          : selected.found ? "A captured tool call has a different argument value" : "The declared argument path is absent from a complete captured tool input",
+        selected.value, rule.equals, [tool.spanId]);
+      }
+    }
+    if (unavailable) return unknown("Tool argument or identity evidence is missing, withheld, incomplete, redacted, truncated or invalid");
+    if (!calls.length) return make("fail", "No captured call has the declared tool name", [], rule.name);
+    const pass = rule.match === "all";
+    return make(pass ? "pass" : "fail", pass ? "Every captured call with the declared name has the expected argument value"
+      : "No captured call with the declared name has the expected argument value", observations,
+    rule.equals, observations.map(({ spanId }) => spanId));
+  }
   const output = snapshot.output;
   if (!output.complete || output.value === null || UNAVAILABLE_EVIDENCE.test(output.value)) return unknown("The selected response is unavailable, redacted, truncated or ambiguous");
   const spanIds = output.spanId ? [output.spanId] : [];
@@ -90,7 +119,12 @@ export function evaluateRule(rule: Rule, snapshot: Snapshot): RuleResult {
     return make(pass ? "pass" : "fail", `Applied ${rule.operation} to the selected captured response`, output.value, rule.value, spanIds);
   }
   let json: unknown;
-  try { json = JSON.parse(output.value); } catch { return make("fail", "Selected response is not valid JSON", output.value, "valid JSON", spanIds); }
+  try { json = parseJsonEvidence(output.value); } catch (error) {
+    if (error instanceof LossyJsonNumberError) return rule.kind === "json"
+      ? make("pass", "Selected response is valid JSON; numeric evidence is retained as captured text", output.value, "valid JSON", spanIds)
+      : unknown("Captured JSON numeric values cannot be compared without rounding, overflow or underflow");
+    return make("fail", "Selected response is not valid JSON", output.value, "valid JSON", spanIds);
+  }
   if (rule.kind === "json") return make("pass", "Selected response is valid JSON", json, "valid JSON", spanIds);
   const selected = selectPath(json, rule.path);
   if (!selected.found) return make("fail", "The declared own-property JSON path is absent from the complete response", null, rule.equals, spanIds);

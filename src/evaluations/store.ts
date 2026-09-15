@@ -1,9 +1,10 @@
 import { randomUUID, createHash } from "node:crypto";
-import { and, asc, desc, eq, inArray, count } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, count, sql } from "drizzle-orm";
 import { getDrizzleDb } from "../db";
 import { evaluation_datasets as datasets, evaluation_revisions as revisions, evaluation_experiments as experiments, evaluation_reviews as reviews } from "../db/schema";
 import { canonicalCaseDefinitions, EvaluationError } from "./validation";
 import { EVALUATION_LIMITS as L, type Dataset, type DatasetCase, type DatasetRevision, type Experiment, type ExperimentSummary, type Review } from "./protocol";
+import { MAX_TRIAL_ACQUISITION_BYTES, parseTrialSelection } from "./trials";
 
 export function listDatasets(): Dataset[] {
   return getDrizzleDb().select().from(datasets).orderBy(desc(datasets.created_at)).all()
@@ -82,6 +83,19 @@ export function getExperimentRecord(id: string) {
   return { experiment: JSON.parse(row.data) as Experiment, token: row.job_token, completedChecks: row.completed_checks };
 }
 export function getExperiment(id: string): Experiment { return getExperimentRecord(id).experiment; }
+export function readExperimentSelection(ids: string[], consume: (experiment: Experiment) => void): void {
+  parseTrialSelection({ experimentIds: ids });
+  getDrizzleDb().transaction(tx => {
+    const bound = tx.select({ count: count(), bytes: sql<number>`coalesce(sum(length(cast(${experiments.data} as blob))), 0)` })
+      .from(experiments).where(inArray(experiments.id, ids)).get()!;
+    if (bound.count !== ids.length) throw new EvaluationError("Experiment not found", 404);
+    if (bound.bytes > MAX_TRIAL_ACQUISITION_BYTES) throw new EvaluationError("Selected experiment evidence exceeds 8 MiB", 413);
+    for (const id of ids) {
+      const row = tx.select({ data: experiments.data }).from(experiments).where(eq(experiments.id, id)).get()!;
+      consume(JSON.parse(row.data) as Experiment);
+    }
+  });
+}
 export function listExperiments(): ExperimentSummary[] {
   return getDrizzleDb().select({ summary: experiments.summary }).from(experiments).orderBy(desc(experiments.created_at)).limit(50).all()
     .map((row) => JSON.parse(row.summary));

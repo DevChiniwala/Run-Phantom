@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { X, Loader2, AlertCircle, RotateCcw, ArrowRight } from "lucide-react";
 import { RunDetail } from "./RunDetail";
+import { RunComparison } from "./RunComparison";
 import { C } from "../utils/colors";
 import { useIsCompactWorkspace } from "../hooks/use-mobile";
 
@@ -129,6 +130,7 @@ export function ReplayView({ originalRunId, originalName, replayRunId, error, is
         )}
       </div>
 
+      {replayRunId && <RunComparison baselineRunId={originalRunId} candidateRunId={replayRunId} />}
       <div className="flex-1 flex min-h-0">
         <div className="min-w-0 overflow-auto sb" style={{ width: comparisonVisible ? `${leftPct}%` : "100%" }}>
           {replayRunId ? (

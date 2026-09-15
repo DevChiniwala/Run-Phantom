@@ -16,6 +16,21 @@ import {
 
 const TOOLS = [
   {
+    name: "search_runs",
+    description: "Search all local run history with literal text across run metadata and span names, inputs and outputs. Returns bounded run summaries without payloads, newest started_at first. Text matching folds ASCII case and treats other Unicode literally. Filter model/provider exactly on the same span. Follow nextCursor while hasMore; refresh after runs change. Use get_run_outline or get_span_payload to inspect evidence.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", maxLength: 256, description: "Literal substring; empty browses all runs. %, _ and quotes are literal." },
+        status: { type: "string", enum: ["all", "running", "completed", "failed"] },
+        model: { type: "string", maxLength: 256 },
+        provider: { type: "string", maxLength: 256 },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Page size, default 50." },
+        cursor: { type: "string", maxLength: 4096, description: "Opaque nextCursor from the preceding page." },
+      },
+    },
+  },
+  {
     name: "get_current_run",
     description: "Resolve the single run Run Phantom is focused on, plus the selected span when the UI has one. Takes no arguments. Use when the user refers to the trace, run, screen, or selected span without giving ids. Returns source, run, selected_span_id, selected_span, and size hints. This is the focused run, not search or history.",
     inputSchema: { type: "object", properties: {} },
@@ -178,10 +193,10 @@ function describeNotFound(path: string): string {
   return "The requested Run Phantom resource does not exist.";
 }
 
-async function callBackend(url: string, path: string): Promise<any> {
+async function callBackend(url: string, path: string, signal?: AbortSignal): Promise<any> {
   let res: Response;
   try {
-    res = await fetch(url + path);
+    res = await fetch(url + path, { signal });
   } catch (err) {
     throw backendUnreachableError(url, err);
   }
@@ -309,13 +324,26 @@ export function registerTraceReadTools(
     tools: [...TOOLS, ...VERIFICATION_TOOLS, ...EVALUATION_TOOLS].map((t) => ({ ...t })),
   }));
 
-  mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const { name, arguments: args = {} } = req.params;
     const verificationResult = await callVerificationTool(name, args, backendUrl);
     if (verificationResult) return verificationResult;
     const evaluationResult = await callEvaluationTool(name, args, backendUrl);
     if (evaluationResult) return evaluationResult;
     switch (name) {
+      case "search_runs": {
+        const params = new URLSearchParams();
+        for (const key of ["q", "status", "model", "provider", "cursor"] as const) {
+          if (args[key] === undefined) continue;
+          if (typeof args[key] !== "string") throw new McpError(ErrorCode.InvalidParams, `${key} must be a string`);
+          params.set(key, args[key]);
+        }
+        if (args.limit !== undefined) {
+          if (typeof args.limit !== "number" || !Number.isInteger(args.limit)) throw new McpError(ErrorCode.InvalidParams, "limit must be an integer from 1 to 100");
+          params.set("limit", String(args.limit));
+        }
+        return textResult(await callBackend(backendUrl, `/api/runs/search?${params}`, extra.signal));
+      }
       case "get_current_run": {
         try {
           const viewedRes = await fetch(`${backendUrl}/api/ui/viewing`);

@@ -47,6 +47,67 @@ export class AnnotationNotFoundError extends Error {
 // so an unbounded note lets a single write make a run unreadable for good.
 export const MAX_NOTE_CHARS = 10_000;
 
+export const MAX_IMPORTED_ANNOTATIONS = 2_000;
+
+/** Validate portable annotation data without consulting or modifying the store. */
+export function parseImportedAnnotations(value: unknown, runId: string, spanIds: ReadonlySet<string>): Annotation[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_IMPORTED_ANNOTATIONS) {
+    throw new InvalidAnnotationError(`annotations must be an array of at most ${MAX_IMPORTED_ANNOTATIONS} entries`);
+  }
+  const seen = new Set<string>();
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new InvalidAnnotationError(`annotations[${index}] must be an object`);
+    }
+    const row = item as Record<string, unknown>;
+    if (typeof row.id !== "string" || !row.id.trim() || row.id.length > 1024 || seen.has(row.id)) {
+      throw new InvalidAnnotationError(`annotations[${index}].id must be a unique non-empty string of at most 1024 characters`);
+    }
+    seen.add(row.id);
+    if (row.run_id !== runId) throw new InvalidAnnotationError(`annotations[${index}].run_id must match run.id`);
+    if (row.span_id !== null && (typeof row.span_id !== "string" || !spanIds.has(row.span_id))) {
+      throw new InvalidAnnotationError(`annotations[${index}].span_id must reference an incoming span or be null`);
+    }
+    if (!KINDS.has(row.kind as AnnotationKind) || !SOURCES.has(row.source as AnnotationSource)) {
+      throw new InvalidAnnotationError(`annotations[${index}] has an invalid kind or source`);
+    }
+    if (row.note !== null && (typeof row.note !== "string" || row.note.length > MAX_NOTE_CHARS)) {
+      throw new InvalidAnnotationError(`annotations[${index}].note must be null or a string of at most ${MAX_NOTE_CHARS} characters`);
+    }
+    const note = typeof row.note === "string" ? row.note.trim() || null : null;
+    if (row.kind === "note" && !note) throw new InvalidAnnotationError(`annotations[${index}] needs a note`);
+    if (typeof row.created_at !== "number" || !Number.isSafeInteger(row.created_at) || row.created_at < 0) {
+      throw new InvalidAnnotationError(`annotations[${index}].created_at must be non-negative integer milliseconds`);
+    }
+    return {
+      id: row.id, run_id: runId, span_id: row.span_id as string | null,
+      kind: row.kind as AnnotationKind, note, source: row.source as AnnotationSource, created_at: row.created_at,
+    };
+  });
+}
+
+/** Call inside the import transaction, before replacing spans. Local notes survive. */
+export function importAnnotations(rows: Annotation[], runId: string, incomingSpanIds: ReadonlySet<string>): void {
+  const db = getDrizzleDb();
+  for (const local of getAnnotationsByRun(runId)) {
+    if (local.span_id !== null && !incomingSpanIds.has(local.span_id)) {
+      throw new InvalidAnnotationError(`import would orphan local annotation ${local.id}`);
+    }
+  }
+  for (const row of rows) {
+    const existing = db.select().from(annotations).where(eq(annotations.id, row.id)).get();
+    if (existing) {
+      const same = existing.run_id === row.run_id && existing.span_id === row.span_id
+        && existing.kind === row.kind && (existing.note?.trim() || null) === row.note
+        && existing.source === row.source && existing.created_at === row.created_at;
+      if (!same) throw new InvalidAnnotationError(`annotation identity conflict: ${row.id}`);
+      continue;
+    }
+    db.insert(annotations).values(row).run();
+  }
+}
+
 export function createAnnotation(input: CreateAnnotationInput): Annotation {
   if (typeof input.run_id !== "string" || !input.run_id) {
     throw new InvalidAnnotationError("run_id is required");

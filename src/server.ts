@@ -7,12 +7,15 @@ import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
 import { normalizeOtelId } from "./ids";
+import { searchRuns, RunSearchError } from "./run-search";
+import { getRunComparison, RunComparisonError } from "./run-comparison";
 import { parseOtlpRequest } from "./parse";
 import { decodeOtlpProtobuf } from "./otlp-protobuf";
 import {
   upsertRun,
   insertSpan,
   getRuns,
+  getDrizzleDb,
   getRunWithSpans,
   getRunsByConvoId,
   clearAll,
@@ -30,7 +33,6 @@ import {
   getRunOutline,
   listSpansFiltered,
   countSpansFiltered,
-  deleteRunSpans,
   searchRun,
   tailLiveEvents,
   listSavedEvents,
@@ -47,6 +49,7 @@ import {
   queryTracesBounded,
 } from "./db";
 import { sliceSpanPayload } from "./payload-slice";
+import { exportTrace, importTrace, InvalidTraceImportError } from "./trace-export";
 import { detectSubAgents } from "./agents";
 import { detectProvider, getProviderBaseURL, getProviderHeaders, isSupportedProvider } from "./provider-options";
 import { runReplay } from "./replay";
@@ -102,6 +105,7 @@ import { VERIFICATION_LIMITS } from "./verification/protocol";
 import { createEvaluationService } from "./evaluations/service";
 import { createEvaluationRouter } from "./evaluations/router";
 import { EVALUATION_LIMITS } from "./evaluations/protocol";
+import { parseJsonEvidence, LossyJsonNumberError } from "./evaluations/json-evidence";
 import {
   getEffectiveSecret,
   getSecretStatus,
@@ -931,7 +935,10 @@ export async function createServer(port: number) {
     next();
   });
   app.use("/api/verification", express.json({ limit: VERIFICATION_LIMITS.MAX_FRAME_BYTES }));
-  app.use("/api/evaluations", express.json({ limit: EVALUATION_LIMITS.MAX_REQUEST }));
+  app.use("/api/evaluations", express.json({
+    limit: EVALUATION_LIMITS.MAX_REQUEST,
+    verify: (_req, _res, body, encoding) => { parseJsonEvidence(new TextDecoder(encoding).decode(body)); },
+  }));
   app.use(express.json({ limit: "50mb" }));
   // Accept protobuf bodies so Traceloop OTLP exports aren't silently dropped
   app.use(express.raw({ limit: "50mb", type: "application/x-protobuf" }));
@@ -941,6 +948,10 @@ export async function createServer(port: number) {
   // node_modules paths (and the OS username). Keep the JSON error contract.
   app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (!err) return next();
+    if (err instanceof LossyJsonNumberError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
     const status = (err as { status?: number; statusCode?: number }).status
       ?? (err as { statusCode?: number }).statusCode
       ?? 500;
@@ -1205,6 +1216,35 @@ export async function createServer(port: number) {
     const raw = Number(req.query.limit);
     const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 5000) : 5000;
     res.json(getRuns(limit));
+  });
+  app.get("/api/runs/search", async (req, res) => {
+    const cancellation = new AbortController();
+    const onClose = () => { if (!res.writableEnded) cancellation.abort(); };
+    res.on("close", onClose);
+    try {
+      const result = await searchRuns(req.query, { signal: cancellation.signal });
+      if (!res.destroyed) res.json(result);
+    } catch (error) {
+      if (!res.destroyed) {
+        const status = error instanceof RunSearchError ? error.status : 500;
+        if (status === 503) res.setHeader("Retry-After", "1");
+        res.status(status).json({ error: error instanceof Error ? error.message : "Search failed" });
+      }
+    } finally {
+      res.removeListener("close", onClose);
+    }
+  });
+  app.get("/api/runs/compare", (req, res) => {
+    try {
+      res.setHeader("Cache-Control", "no-store");
+      res.json(getRunComparison(getDrizzleDb().$client, req.query));
+    } catch (error) {
+      const expected = error instanceof RunComparisonError;
+      res.status(expected ? error.status : 500).json({
+        error: expected ? error.message : "Run comparison failed",
+        code: expected ? error.code : "comparison_failed",
+      });
+    }
   });
   app.get("/api/runs/active", (_req, res) => {
     const run = getMostRecentlyTouchedRun();
@@ -2291,159 +2331,28 @@ export async function createServer(port: number) {
     res.json({ ok: true });
   });
 
-  // Import a run and spans supplied by a trusted local integration.
-  // Metadata is stored as a JSON string, so an export round-trips it back as
-  // either the object it was or the string it was serialised to. Accept both and
-  // drop anything that is neither rather than writing "[object Object]".
-  function parseImportedMetadata(value: unknown): Record<string, any> | undefined {
-    if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, any>;
-    if (typeof value === "string" && value) {
-      try {
-        const parsed = JSON.parse(value);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-      } catch { /* not JSON; the event keeps no metadata */ }
+  app.get("/api/runs/:id/export", (req, res) => {
+    try {
+      const trace = exportTrace(req.params.id);
+      if (!trace) { res.status(404).json({ error: "Not found" }); return; }
+      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`trace-${req.params.id}.json`)}`);
+      res.json(trace);
+    } catch (error) {
+      if (error instanceof InvalidTraceImportError) { res.status(413).json({ error: error.message }); return; }
+      res.status(500).json({ error: "Could not export trace" });
     }
-    return undefined;
-  }
+  });
 
   app.post("/api/import-run", (req, res) => {
-    const { run, spans } = req.body;
-    // The export written by the run-detail Download button includes liveEvents,
-    // but import only ever read run + spans — so a round trip silently dropped
-    // the agent's streamed reasoning and the Conversation tab came back empty.
-    const liveEvents = Array.isArray(req.body?.liveEvents) ? req.body.liveEvents : [];
-    if (typeof run?.id !== "string" || !run.id || !Array.isArray(spans)) {
-      res.status(400).json({ error: "run.id must be a non-empty string and spans must be an array" });
-      return;
-    }
-
-    // Everything is validated before a single row is written. The old order —
-    // upsert the run, then insert spans one at a time outside a transaction —
-    // meant a payload that failed partway through had already overwritten an
-    // existing run's name, metadata and timestamps and left a partial span set
-    // behind, then returned 500. A rejected import destroyed a good run.
-    const optionalString = (v: unknown) => v === undefined || v === null || typeof v === "string";
-    const optionalNumber = (v: unknown) =>
-      v === undefined || v === null || (typeof v === "number" && Number.isFinite(v));
-
-    for (const [field, value] of Object.entries({
-      name: run.name, event_name: run.event_name, user_id: run.user_id,
-      convo_id: run.convo_id, metadata: run.metadata,
-    })) {
-      if (!optionalString(value)) {
-        res.status(400).json({ error: `run.${field} must be a string when present` });
-        return;
-      }
-    }
-    // A non-numeric timestamp is written straight into the column that orders the
-    // run list, and no later event can correct it.
-    for (const field of ["started_at", "last_updated_at"] as const) {
-      if (!optionalNumber(run[field])) {
-        res.status(400).json({ error: `run.${field} must be a finite number of milliseconds when present` });
-        return;
-      }
-    }
-
-    for (let i = 0; i < spans.length; i++) {
-      const s = spans[i];
-      if (!s || typeof s !== "object" || Array.isArray(s)) {
-        res.status(400).json({ error: `spans[${i}] must be an object` });
-        return;
-      }
-      if (typeof s.id !== "string" || !s.id || typeof s.name !== "string" || !s.name) {
-        res.status(400).json({ error: `spans[${i}].id and spans[${i}].name must be non-empty strings` });
-        return;
-      }
-      for (const field of ["start_time_ms", "end_time_ms", "duration_ms"] as const) {
-        const v = s[field];
-        if (typeof v !== "number" || !Number.isFinite(v)) {
-          res.status(400).json({ error: `spans[${i}].${field} must be a finite number` });
-          return;
-        }
-      }
-      for (const field of ["parent_span_id", "span_type", "status", "input_payload", "output_payload", "model", "provider", "attributes"] as const) {
-        if (!optionalString(s[field])) {
-          res.status(400).json({ error: `spans[${i}].${field} must be a string when present` });
-          return;
-        }
-      }
-      for (const field of ["input_tokens", "output_tokens"] as const) {
-        if (!optionalNumber(s[field])) {
-          res.status(400).json({ error: `spans[${i}].${field} must be a finite number when present` });
-          return;
-        }
-      }
-    }
-
-    for (let i = 0; i < liveEvents.length; i++) {
-      const e = liveEvents[i];
-      if (!e || typeof e !== "object" || Array.isArray(e)) {
-        res.status(400).json({ error: `liveEvents[${i}] must be an object` });
-        return;
-      }
-      if (typeof e.type !== "string" || !e.type) {
-        res.status(400).json({ error: `liveEvents[${i}].type must be a non-empty string` });
-        return;
-      }
-      if (e.timestamp !== undefined && e.timestamp !== null &&
-          (typeof e.timestamp !== "number" || !Number.isFinite(e.timestamp))) {
-        res.status(400).json({ error: `liveEvents[${i}].timestamp must be a finite number when present` });
-        return;
-      }
-      for (const field of ["span_id", "content"] as const) {
-        if (!optionalString(e[field])) {
-          res.status(400).json({ error: `liveEvents[${i}].${field} must be a string when present` });
-          return;
-        }
-      }
-    }
-
-    const now = Date.now();
     try {
-      runInTransaction(() => {
-        // Import means restore, so the stored run must match the file. Upserting
-        // on top of an existing run produced the union of both span sets.
-        deleteRunSpans(run.id);
-        upsertRun({
-          id: run.id,
-          name: run.name ?? null,
-          event_name: run.event_name ?? null,
-          user_id: run.user_id ?? null,
-          convo_id: run.convo_id ?? null,
-          started_at: run.started_at ?? now,
-          last_updated_at: run.last_updated_at ?? now,
-          metadata: run.metadata ?? null,
-        });
-        for (const s of spans) {
-          insertSpan({
-            id: s.id, run_id: run.id, parent_span_id: s.parent_span_id ?? undefined,
-            name: s.name, span_type: s.span_type ?? undefined, status: s.status ?? "UNSET",
-            input_payload: s.input_payload ?? undefined, output_payload: s.output_payload ?? undefined,
-            start_time_ms: s.start_time_ms, end_time_ms: s.end_time_ms, duration_ms: s.duration_ms,
-            model: s.model ?? undefined, provider: s.provider ?? undefined,
-            input_tokens: s.input_tokens ?? undefined, output_tokens: s.output_tokens ?? undefined,
-            attributes: s.attributes ?? undefined,
-          });
-        }
-        for (const e of liveEvents) {
-          upsertLiveEvent({
-            traceId: run.id,
-            spanId: typeof e.span_id === "string" && e.span_id ? e.span_id : undefined,
-            type: e.type,
-            content: typeof e.content === "string" ? e.content : undefined,
-            timestamp: typeof e.timestamp === "number" ? e.timestamp : now,
-            metadata: parseImportedMetadata(e.metadata),
-          });
-        }
-      });
-    } catch (err) {
-      console.error("[runphantom] import failed:", err);
-      res.status(400).json({ error: `import rejected: ${(err as Error).message}` });
-      return;
+      const imported = importTrace(req.body);
+      broadcast("spans", { runIds: [imported.runId] });
+      res.json({ ok: true, ...imported });
+    } catch (error) {
+      const message = error instanceof InvalidTraceImportError || error instanceof InvalidAnnotationError
+        ? error.message : "stored data conflicts with imported trace";
+      res.status(400).json({ error: `import rejected: ${message}` });
     }
-
-    broadcast("spans", { runIds: [run.id] });
-    res.json({ ok: true, runId: run.id, spansImported: spans.length, liveEventsImported: liveEvents.length });
   });
 
   // Summarize an event using Haiku (server-side to avoid CORS)

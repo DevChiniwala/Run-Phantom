@@ -460,6 +460,8 @@ test("release audit: mobile navigation exposes an explicit close control", async
 
 test("release audit: keyboard users receive a visible skip target", async ({ page, runPhantom }) => {
   await page.goto(`${runPhantom.url}/runs`);
+  // Document load can precede the asynchronously imported local layout.
+  await expect(page.getByRole("link", { name: "Skip to trace workspace", exact: true })).toBeAttached();
   await page.keyboard.press("Tab");
 
   const active = page.locator(":focus");
@@ -471,6 +473,8 @@ test("release audit: keyboard users receive a visible skip target", async ({ pag
   });
   expect(focusStyle.outlineStyle).not.toBe("none");
   expect(Number.parseFloat(focusStyle.outlineWidth)).toBeGreaterThanOrEqual(2);
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#runphantom-main")).toBeFocused();
 });
 
 test("release audit: the empty workspace reflows at 320px", async ({ page, runPhantom }) => {

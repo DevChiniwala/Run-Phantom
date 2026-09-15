@@ -1,9 +1,11 @@
 import { normalizeStoredSpan } from "../spans/normalize";
 import type { NormalizedSpan } from "../spans/normalized";
-import { redactText } from "../verification/serialization";
+import { outputCompletionEvidence, type OutputCompletion } from "../spans/completion";
+import { redactText, sanitizeWithReport } from "../verification/serialization";
 import { isSensitiveKey } from "../verification/redaction";
-import { EVALUATION_LIMITS as L, SNAPSHOT_VERSION, UNAVAILABLE_EVIDENCE, type Snapshot, type SnapshotRun, type SnapshotSpan } from "./protocol";
+import { EVALUATION_LIMITS as L, SNAPSHOT_VERSION, UNAVAILABLE_EVIDENCE, type Snapshot, type SnapshotRun, type SnapshotSpan, type ToolArgumentEvidence } from "./protocol";
 import { EvaluationError, parseId } from "./validation";
+import { LossyJsonNumberError, parseJsonEvidence } from "./json-evidence";
 
 export const REPORTED_COST_ALIASES = ["gen_ai.usage.cost_usd", "gen_ai.usage.cost", "runphantom.cost.usd", "llm.cost.total", "llm.usage.cost", "ai.usage.cost"] as const;
 const INPUT_ALIASES = ["gen_ai.usage.input_tokens", "ai.usage.inputTokens", "gen_ai.usage.prompt_tokens", "ai.usage.promptTokens", "ai.usage.prompt_tokens", "llm.token_count.prompt"];
@@ -30,7 +32,7 @@ export function sanitizeSnapshotText(value: unknown): { value: string | null; re
   let sensitive = redactText(value) !== value;
   try { sensitive ||= secretStructure(JSON.parse(value)); } catch { /* plain text is a supported payload */ }
   if (sensitive) return { value: "[REDACTED]", redacted: true, truncated: false };
-  if (UNAVAILABLE_EVIDENCE.test(value)) return { value: null, redacted: /\[REDACTED\]/i.test(value), truncated: true };
+  if (UNAVAILABLE_EVIDENCE.test(value)) return { value: null, redacted: /\[REDACTED\]|__REDACTED__/i.test(value), truncated: true };
   const bounded = clipped(value, L.MAX_TEXT_BYTES);
   return { value: bounded, redacted: false, truncated: bounded !== value };
 }
@@ -49,8 +51,28 @@ function sum(values: Array<number | null>): number | null {
 interface SpanView {
   row: SnapshotSpan; attrs: Record<string, unknown>; attrsAvailable: boolean; normalized: NormalizedSpan;
   input: string | null; output: string | null; started: number | null; ended: number | null; complete: boolean;
+  outputCompletion: OutputCompletion;
+  inputSource: ToolArgumentEvidence["source"];
   error: boolean; statusKnown: boolean; provider: string; model: string;
   inputTokens: number | null; outputTokens: number | null; totalTokens: number | null; cost: number | null;
+}
+function toolArguments(view: SpanView, identityAvailable: boolean): ToolArgumentEvidence {
+  const unavailable = (status: ToolArgumentEvidence["status"]): ToolArgumentEvidence => ({ status, source: view.inputSource, value: null });
+  if (!view.complete) return unavailable("incomplete");
+  if (!identityAvailable || view.row.unavailable?.input) return unavailable("withheld");
+  if (view.input === null) return unavailable(view.row.input_payload !== null ? "truncated" : "missing");
+  if (typeof view.input !== "string") return unavailable("invalid");
+  if (bytes(view.input) > L.MAX_TOOL_ARGUMENT_BYTES) return unavailable("truncated");
+  const safe = sanitizeSnapshotText(view.input);
+  if (safe.redacted) return unavailable("redacted");
+  if (safe.truncated || safe.value === null) return unavailable("truncated");
+  try {
+    const bounded = sanitizeWithReport(parseJsonEvidence(safe.value));
+    if (bounded.redacted) return unavailable("redacted");
+    if (bounded.truncation) return unavailable("truncated");
+    return { status: "available", source: view.inputSource, value: bounded.value };
+  }
+  catch (error) { return unavailable(error instanceof LossyJsonNumberError ? "truncated" : "invalid"); }
 }
 function first(attrs: Record<string, unknown>, keys: readonly string[], fallback?: unknown): unknown {
   for (const key of keys) if (Object.hasOwn(attrs, key)) return attrs[key];
@@ -137,6 +159,7 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
         else attrs = raw as Record<string, unknown>;
       } catch { attrsAvailable = false; }
     }
+    const outputCompletion = outputCompletionEvidence(row.attributes, attrsAvailable);
     if (!attrsAvailable) { attrs = {}; truncated = true; warn("Some span attributes were withheld or malformed; dependent measurements are unavailable."); }
     const unavailableInput = row.unavailable?.input || row.input_payload !== null && bytes(row.input_payload) > L.MAX_PAYLOAD_BYTES;
     const unavailableOutput = row.unavailable?.output || row.output_payload !== null && bytes(row.output_payload) > L.MAX_PAYLOAD_BYTES;
@@ -149,6 +172,8 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
       normalized = match.normalized; adapterInput = match.inputPayload; adapterOutput = match.outputPayload;
     } catch { warn("A span's SDK payload could not be normalized."); }
     const input = unavailableInput ? null : row.input_payload ?? adapterInput ?? (typeof attrs["runphantom.input"] === "string" ? attrs["runphantom.input"] : null);
+    const inputSource: ToolArgumentEvidence["source"] = row.input_payload !== null ? "inputPayload" : adapterInput !== undefined ? "adapterInput"
+      : typeof attrs["runphantom.input"] === "string" ? "runphantomInput" : null;
     const output = unavailableOutput ? null : row.output_payload ?? adapterOutput ?? (typeof attrs["runphantom.output"] === "string" ? attrs["runphantom.output"] : null);
     const started = finite(row.start_time_ms), ended = finite(row.end_time_ms);
     const complete = started !== null && ended !== null && ended >= started && ended > 0;
@@ -161,10 +186,10 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
     if (totalTokens !== null && inputTokens !== null && outputTokens !== null && totalTokens !== inputTokens + outputTokens) {
       totalTokens = null; warn("A reported token total conflicts with its input/output counts.");
     }
-    return { row, attrs, attrsAvailable, normalized, input, output, started, ended, complete, error,
+    return { row, attrs, attrsAvailable, normalized, input, inputSource, output, started, ended, complete, outputCompletion, error,
       statusKnown: attrsAvailable && ["OK", "UNSET", "ERROR"].includes(status),
-      provider: text(first(attrs, ["gen_ai.provider.name", "ai.model.provider", "gen_ai.system", "llm.system"], row.provider)) ?? "Unavailable",
-      model: text(first(attrs, ["gen_ai.response.model", "ai.response.model", "gen_ai.request.model", "ai.model.id", "llm.request.model"], row.model)) ?? "Unavailable",
+      provider: text(first(attrs, ["gen_ai.provider.name", "llm.provider", "ai.model.provider", "gen_ai.system", "llm.system"], row.provider)) ?? "Unavailable",
+      model: text(first(attrs, ["gen_ai.response.model", "ai.response.model", "llm.response.model_name", "gen_ai.request.model", "ai.model.id", "llm.model_name", "llm.request.model_name", "llm.request.model"], row.model)) ?? "Unavailable",
       inputTokens, outputTokens, totalTokens, cost: attrsAvailable ? finite(first(attrs, REPORTED_COST_ALIASES)) : null };
   });
   const byId = new Map<string, SpanView>();
@@ -224,6 +249,7 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
   const safeOutput = sanitizeSnapshotText(selected?.output);
   redacted ||= safeOutput.redacted; truncated ||= safeOutput.truncated;
   if (selected && (safeOutput.redacted || safeOutput.truncated || safeOutput.value === null)) warn("Selected response is redacted, truncated or unavailable.");
+  if (selected?.outputCompletion === "unconfirmed") warn("The selected response lacks trustworthy completion evidence; its captured output remains inspectable but completion is unknown.");
   let input: string | null = null;
   const rootInputs = agentRoots.filter((view) => view.input !== null);
   if (rootInputs.length === 1) {
@@ -249,12 +275,23 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
   const metric = (rows: SpanView[], key: "inputTokens" | "outputTokens" | "totalTokens" | "cost") => sum(rows.map((view) => nested.has(view) ? null : view[key]));
   const toolRows = views.filter((view) => view.row.span_type === "TOOL_CALL");
   let toolsComplete = complete;
+  let argumentBytes = 0;
   const tools = toolRows.slice(0, 200).map((view) => {
     const rawName = view.normalized.kind === "tool" ? view.normalized.name : view.row.name;
     let name = view.attrsAvailable ? text(rawName) : null;
     if (name !== null && bytes(name) > L.MAX_NAME) { name = null; truncated = true; warn("A tool identity exceeded its size limit; name/order assertions are unavailable."); }
     if (name === null || !view.complete) toolsComplete = false;
-    return { spanId: view.row.id, name: name ?? "Unavailable", startedAt: view.started, endedAt: view.ended, error: view.error };
+    const argumentsEvidence = toolArguments(view, name !== null);
+    if (argumentsEvidence.status === "available") {
+      const size = bytes(JSON.stringify(argumentsEvidence.value));
+      if (argumentBytes + size > L.MAX_TOOL_ARGUMENT_TOTAL_BYTES) {
+        argumentsEvidence.status = "truncated"; argumentsEvidence.value = null;
+      } else argumentBytes += size;
+    }
+    redacted ||= argumentsEvidence.status === "redacted";
+    truncated ||= argumentsEvidence.status === "truncated" || argumentsEvidence.status === "withheld";
+    if (argumentsEvidence.status !== "available") warn("Some captured tool arguments are unavailable; argument checks may be inconclusive.");
+    return { spanId: view.row.id, name: name ?? "Unavailable", startedAt: view.started, endedAt: view.ended, error: view.error, arguments: argumentsEvidence };
   }).sort((a, b) => (a.startedAt ?? Infinity) - (b.startedAt ?? Infinity));
   if (tools.length !== toolRows.length) { toolsComplete = false; truncated = true; warn("Tool evidence list was bounded; name/order assertions are unavailable."); }
   const groups = new Map<string, SpanView[]>();
@@ -269,13 +306,19 @@ export function snapshotRun(run: SnapshotRun, spans: SnapshotSpan[], outputSpanI
   const snapshot: Snapshot = {
     version: SNAPSHOT_VERSION, runId: run.id, runName: clipped(text(run.display_name ?? run.event_name ?? run.name ?? run.id) ?? "Unavailable", L.MAX_NAME), capturedAt: Date.now(),
     complete, warnings, input, output: { value: safeOutput.value, spanId: selected?.row.id ?? null, source,
-      complete: complete && !!selected?.complete && safeOutput.value !== null && !safeOutput.redacted && !safeOutput.truncated },
+      complete: complete && !!selected?.complete && selected.outputCompletion !== "unconfirmed" && safeOutput.value !== null && !safeOutput.redacted && !safeOutput.truncated },
     tools, toolsComplete, metrics: { inputTokens: metric(generations, "inputTokens"), outputTokens: metric(generations, "outputTokens"), totalTokens: metric(generations, "totalTokens"),
       durationMs: complete ? Math.max(...views.map((view) => view.ended!)) - Math.min(...views.map((view) => view.started!)) : null,
       costUsd: metric(generations, "cost"), toolCalls: toolRows.length,
       errorSpans: views.every((view) => view.statusKnown) ? views.filter((view) => view.error).length : null },
     models, redacted, truncated,
   };
+  // Absent argument evidence stays unavailable; preserve established identity/timing evidence first.
+  for (let i = snapshot.tools.length - 1; i >= 0 && bytes(JSON.stringify(snapshot)) > L.MAX_SNAPSHOT; i--) {
+    delete snapshot.tools[i].arguments;
+    snapshot.truncated = true;
+    warn("Tool argument evidence was shortened to the snapshot storage limit.");
+  }
   while (bytes(JSON.stringify(snapshot)) > L.MAX_SNAPSHOT && (snapshot.tools.length || snapshot.models.length)) {
     snapshot.truncated = true;
     if (snapshot.tools.length) { snapshot.tools.pop(); snapshot.toolsComplete = false; }

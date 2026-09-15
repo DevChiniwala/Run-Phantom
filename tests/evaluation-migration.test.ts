@@ -89,7 +89,7 @@ test("evaluation migration upgrades schema 0005 without changing traces or verif
     const experiment = getExperiment(started.id);
     expect(experiment.status).toBe("completed");
     expect(experiment.verdict).toBe("pass");
-    expect(experiment.results[0].checks[0]).toMatchObject({ status: "pass", source: "code", evaluatorVersion: "code:1" });
+    expect(experiment.results[0].checks[0]).toMatchObject({ status: "pass", source: "code", evaluatorVersion: "code:2" });
     const review = addReview(experiment.id, { caseId: revision.cases[0].id, rating: "fail", note: "Human feedback remains independent of the passing text check." });
     expect(getExperiment(experiment.id).verdict).toBe("pass");
 
