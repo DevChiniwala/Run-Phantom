@@ -1,233 +1,319 @@
-# Run Phantom
+<p align="center">
+  <img src="./app/public/favicon.svg" width="72" height="72" alt="">
+</p>
 
-Run Phantom is a local-first debugger for AI-agent runs. It captures traces,
-spans, tool calls, replay state, and local agent context so you can inspect what
-happened instead of guessing.
+<h1 align="center">Run Phantom</h1>
 
-Owned and maintained by Divyam Talwar, who holds all rights in the software.
+<p align="center"><strong>See the run. Find the reason.</strong></p>
 
-**See the run. Find the reason.**
+<p align="center">
+  Local debugging · Regression evaluations · Shared projects
+</p>
 
-## What It Does
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#connect-your-agent">Connect your agent</a> ·
+  <a href="#shared-projects">Team setup</a> ·
+  <a href="#documentation">Documentation</a> ·
+  <a href="./LICENSE">MIT license</a>
+</p>
 
-- Runs a local daemon and UI for inspecting agent runs
-- Ingests OTLP traces and stores them in SQLite
-- Searches, annotates, saves, exports, and compares trace evidence
-- Searches the full local trace store, including captured prompts and tool results, with status/model/provider filters
-- Replays captured runs against project-owned local replay endpoints
-- Opens trace-aware Claude Code or Codex sessions when those local CLIs are installed
-- Exposes MCP and CLI entry points for supported local workflows
-- Checks tool arguments in frozen regression cases and exports JSON/JUnit reports for CI
-- Compares captured changes and analyzes repeated trials with explicit missing-evidence bounds
-- Shares project traces, notes, and saved checks through an isolated authenticated team service
-- Ships as source-first code from this repository
+Run Phantom is an open-source debugger for AI-agent runs. Inspect the prompts,
+tool calls, outputs, and timing behind a result. Replay through your own code,
+check a change against frozen evidence, and give your team a shared place to
+investigate failures.
 
-## Build and Run
+The local debugger stores traces in SQLite on your machine. Capture, inspection,
+search, and deterministic evaluations work without a provider API key or a
+hosted Run Phantom account.
 
-Run Phantom requires Bun 1.4.0 or newer.
+![Run Phantom inspecting a completed demo trace, with its span timeline and tool inputs and outputs](./screenshots/local-debugger.png)
+
+<p align="center"><sub>Actual application UI with synthetic example traces.</sub></p>
+
+## From a failed run to a checked change
+
+| Your goal | What Run Phantom gives you |
+| --- | --- |
+| **Understand the failure** | A local timeline, span tree, captured inputs and outputs, tool arguments, errors, and searchable trace history. |
+| **Check the fix** | Structured run comparison, versioned regression datasets, frozen experiment results, and JSON/JUnit reports for CI. |
+| **Investigate together** | A separate authenticated service with project roles, shared traces, authored notes, saved checks, and audit history. |
+
+## Quick start
+
+**Requires Git and Bun 1.4.0 or newer.** Clone the repository and start the app:
 
 ```bash
+git clone https://github.com/RunPhantom/Run-Phantom.git
+cd Run-Phantom
 bun install --frozen-lockfile
 bun run dev
 ```
 
-`bun run dev` starts the daemon on `:5947` and the Vite UI on `:5948` by
-default.
+Open **[http://localhost:5948](http://localhost:5948)** and choose **Load demo
+traces** on the empty Runs screen. The demo uses synthetic data and makes no
+provider calls. Open a run, explore its **Overview** and **Span Tree**, and select
+a span to inspect its evidence.
 
-To run the example suite:
-
-```bash
-bun run dev:examples
-```
-
-## CLI
-
-From a source checkout the CLI is not on your `PATH`. `bun install` links a
-`runphantom-dev` wrapper into `node_modules/.bin`, so invoke it with `bun x`:
+To add three more examples from a second terminal:
 
 ```bash
-bun x runphantom-dev            # start the daemon and open the UI
-bun x runphantom-dev serve      # run in the foreground
-bun x runphantom-dev start      # run in the background
-bun x runphantom-dev stop
-bun x runphantom-dev status
-bun x runphantom-dev open
-bun x runphantom-dev connect    # configure this project for local OTLP export
-bun x runphantom-dev setup      # install skills and MCP into supported agents
-bun x runphantom-dev reset      # delete local traces after confirmation
-bun x runphantom-dev mcp        # serve MCP over stdio
-bun x runphantom-dev sync
-bun x runphantom-dev replay register
-bun x runphantom-dev team serve # shared projects in a separate service on :5949
-bun x runphantom-dev uninstall
+bun run seed:traces
 ```
 
-`bun x runphantom-dev --help` prints the authoritative list.
+These cover a successful edit, a tool failure followed by recovery, and a nested
+subagent review. Continue using the UI on port `5948`.
 
-To get a real `runphantom` binary on your `PATH`, build and install it from
-this checkout:
+| Local service | Default address |
+| --- | --- |
+| Development UI | `http://localhost:5948` |
+| Daemon API and WebSocket | `http://127.0.0.1:5947` |
+| OTLP/HTTP trace endpoint | `http://127.0.0.1:5947/v1/traces` |
+
+<details>
+<summary><strong>Run the built UI or install a local binary</strong></summary>
+
+To serve the built UI from the daemon without the Vite development server, stop
+`bun run dev`, then run:
 
 ```bash
-bun run install:local
+bun run build
+bun x runphantom-dev
 ```
 
-Environment overrides:
+The CLI starts the daemon and opens the built UI on port `5947`. The
+`runphantom-dev` wrapper is linked during dependency installation.
 
-| Env var | Purpose | Default |
-| --- | --- | --- |
-| `RUNPHANTOM_PORT` | HTTP + WebSocket port | `5947` |
-| `RUNPHANTOM_BIND_HOST` | Daemon bind address | `127.0.0.1` |
-| `RUNPHANTOM_UI_PORT` | Vite dev UI port | `5948` |
-| `RUNPHANTOM_DB_PATH` | SQLite database file | `~/.runphantom/runphantom.db` |
-| `RUNPHANTOM_ALLOWED_HOSTS` | Comma-separated extra `Host` header names | unset |
-| `RUNPHANTOM_ALLOWED_SOURCE_IPS` | Exact non-loopback client IPs to permit | unset |
-| `RUNPHANTOM_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to mutate | unset |
-| `RUNPHANTOM_URL` | Daemon URL used by the MCP bridge | `http://127.0.0.1:5947` |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Standard OTLP trace target for examples and integrations | `http://127.0.0.1:5947/v1/traces` |
+To build, install, and smoke-test a standalone binary in a persistent location
+on macOS or Linux:
 
-No API key or LLM is required for capture, storage, inspection, search,
-annotations, downloads, MCP trace tools, or local replay routing. Optional AI
-features use `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or a locally installed and
-authenticated Claude Code or Codex CLI. `.env.example` documents every
-variable, including which component reads it.
+```bash
+bun run install:local --install-dir="$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+runphantom --help
+```
 
-## Search and share debugging evidence
+Add the `PATH` export to your shell configuration to retain it in future shells.
+Without `--install-dir`, the installer uses `/tmp/runphantom-local/bin`.
 
-**Local Search** searches stored run metadata and span names, inputs, and outputs.
-Use status, model, and provider filters to narrow results, and **Load more** to
-page through matches. Text is matched literally; SQL wildcards and regular
-expressions are not evaluated. Searches have a time limit, so narrow a query
-if a large store exceeds it. Results refresh as new traces arrive; pagination
-does not freeze a changing store.
+</details>
 
-**Download** on a run exports a versioned JSON trace with captured spans, live
-events, display/event metadata, and annotations. **Import trace** in Local
-Search restores it into another local workspace. Exports contain captured
-contents and notes, so review them before sharing. Older trace files remain
-supported. Reimporting identical annotations is safe; conflicting annotation
-identities or replacement spans that would orphan a local note reject the
-whole import. An import replaces the captured spans of a run with the same ID.
-If only a saved cache remains, the download identifies it as a legacy saved
-trace: its payloads may be compacted, and it includes only annotations still
-present in the local store.
+## Connect your agent
 
-Current ingestion recognizes standard GenAI tool/agent operations and
-OpenInference LLM/tool/agent conventions alongside the existing SDK adapters.
-This lets multiple instrumented services contribute evidence using their
-existing OTLP exporters.
+Point your instrumented application's **OTLP/HTTP trace exporter** at the local
+daemon:
 
-**Compare captured changes** on a replay shows input/output, model/provider,
-status, usage, and timing differences alongside links to original spans. Unique
-structural matches stay aligned through reordering; repeated calls with
-insufficient identity remain explicitly ambiguous. Missing evidence never
-establishes equality. The existing two-pane trace view remains available.
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:5947/v1/traces
+```
 
-## Shared team projects
+Run Phantom recognizes OpenTelemetry GenAI and OpenInference conventions
+alongside its existing SDK adapters. What appears in a trace depends on what
+your instrumentation captures; configure message content capture when you need
+prompts and responses, and flush the exporter before a short-lived process exits.
 
-Build the UI with `bun run build`, then run `bun src/index.ts team serve` and open
-`http://127.0.0.1:5949/team`. Team mode uses a separate database and authenticated
-project memberships. Administrators invite viewers/editors, issue project
-ingestion keys, and review audit history. Members inspect shared traces, leave
-authored notes, and save deterministic checks against frozen captured inputs.
+The [example applications](./examples/README.md) show complete integrations in
+TypeScript/Bun, Python, Go, and Rust. They export OTLP/HTTP JSON without a Run
+Phantom SDK. Provider-backed examples require their own API keys.
 
-First setup requires the code from the private team data directory. Network
-sharing requires a dedicated HTTPS origin and explicitly trusted reverse-proxy
-peers. The [team service guide](src/team/README.md) describes setup, exporter
-configuration, roles, storage limits, and the local/shared process boundary.
+To write the exporter target into your agent project's `.env` from this checkout:
 
-## Evaluation reports and CI
+```bash
+bun x runphantom-dev connect --file=/path/to/agent-project/.env
+```
 
-In **Evaluations**, create a dataset from captured runs and declare the expected
-response, tools, arguments, errors, or resource limits. A tool-argument rule can
-check a JSON path such as `customer.id` against an expected value, for at least
-one or every call to a named tool. Missing evidence produces an inconclusive
-result. See the [evaluation guide](src/evaluations/README.md) for the evidence
-and versioning rules.
+This configures the destination and opens the built UI. Your application still
+needs instrumentation. Use `bun x runphantom-dev connect --print` to print the
+target without changing files.
 
-Download a **JSON report** or **JUnit report** from an experiment, or check its
-frozen result from a script:
+## Debug with the full context
+
+- **Follow the run.** Move between the overview, span tree, captured messages,
+  and tool details. Inspect available model, usage, status, and timing evidence.
+- **Find the relevant failure.** Search captured inputs, outputs, span names,
+  and run metadata. Narrow results by status, model, or provider.
+- **Keep the evidence.** Annotate and save runs, download a versioned JSON trace,
+  or use **Import trace** in Local Search to open an exported capture.
+- **Compare a change.** Inspect input/output, tool, model, usage, and timing
+  differences. Ambiguous repeated calls and missing evidence remain explicit.
+- **Work from your agent tools.** Use MCP trace tools or open a trace-aware
+  Claude Code or Codex session when the corresponding local CLI is installed
+  and authenticated.
+
+Replay sends a new execution request to a registered, project-owned endpoint.
+Follow the [replay setup guide](./skills/setup-agent-replay/SKILL.md) to add the
+endpoint and `.runphantom/agents.yaml` to your agent project, then register it
+from this checkout:
+
+```bash
+bun x runphantom-dev replay register --cwd=/path/to/agent-project
+```
+
+Your endpoint controls tool side effects, provider calls, and runtime state.
+Replay does not restore arbitrary process checkpoints.
+
+For a connected web application, the **Verification** workspace can also check
+explicit browser outcomes and retain the resulting evidence. See the
+[application verification guide](./src/verification/README.md).
+
+<details>
+<summary><strong>Trace search and import behavior</strong></summary>
+
+Search matches literal text, with bounded execution and paged results. Narrow a
+query if it exceeds the time limit. Pagination follows the live store rather
+than a frozen snapshot.
+
+Trace downloads include captured payloads and annotations; review those contents
+before sharing. Importing a trace with an existing ID replaces its captured
+spans. Identical annotations can be reimported, while conflicting annotation
+identities or changes that would orphan notes reject the whole import.
+
+Exports recovered only from a saved cache are marked as legacy captures and may
+contain compacted payloads.
+
+</details>
+
+## Evaluations and CI
+
+Turn a captured failure into a regression case:
+
+1. Open a run and choose **Evaluate run**.
+2. Create a dataset case with an expected response, JSON value, tool call,
+   argument, error condition, or resource budget.
+3. Select captured candidate runs and start an experiment.
+4. Inspect **pass**, **fail**, or **inconclusive** results, then compare compatible
+   baseline and candidate experiments.
+
+Experiments freeze the dataset revision, candidate evidence, and evaluator
+versions. They score captured runs; starting an experiment does not rerun your
+agent. Missing or mismatched input remains inconclusive. Optional model grading
+requires credentials and explicit opt-in to send selected data to a provider.
+
+Export a **JSON report** or **JUnit report** from the UI, or check saved results
+from a script:
 
 ```bash
 bun scripts/check-evaluation.ts --experiment EXPERIMENT_ID
-bun scripts/check-evaluation.ts --experiment CANDIDATE_ID --baseline BASELINE_ID --format junit --output results.junit.xml
+
+bun scripts/check-evaluation.ts \
+  --experiment CANDIDATE_ID \
+  --baseline BASELINE_ID \
+  --format junit \
+  --output results.junit.xml
 ```
 
-Use `--url http://127.0.0.1:5947` to select a daemon, or set `RUNPHANTOM_URL`.
-The output file must not already exist. Exit code **0** means every case passed;
-**1** means failed, inconclusive, or unfinished evidence; **2** means invalid
-arguments, an incompatible comparison, or an operational error. Baseline and
-candidate must use the same dataset revision and evaluator versions. These
-commands inspect saved evidence without rerunning agents or calling providers.
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Every case passed and the experiment is complete. |
+| `1` | Failed, inconclusive, or unfinished evidence. |
+| `2` | Invalid arguments, incompatible comparison, or an operational error. |
 
-Select **2–20 terminal experiments** in Evaluations to analyze repeated trials.
-Selections must share the same frozen dataset and evaluator definitions, and
-repeated run captures are rejected. The report includes every selected trial,
-pass/fail/unknown counts, resolved coverage, and missing-evidence bounds. These
-bounds describe captured evidence; they are not confidence intervals or proof
-that trials were statistically independent. Cancelled/error campaigns retain
-their separate completion gate. The analysis can be downloaded as versioned JSON
-or requested through MCP without starting new provider calls.
+Baseline comparisons require the same dataset revision and compatible evaluator
+versions. `--output` creates a new file and never overwrites an existing one.
+Use `--url` or `RUNPHANTOM_URL` to select a daemon.
 
-Reports retain case counts, machine verdicts and evaluator versions. They omit
-captured inputs/outputs, expected/actual values, and free-form model explanations.
-JUnit represents inconclusive evidence as an error, so it cannot silently appear
-as a successful skipped test. Human reviews remain separate from machine scores.
+Reports omit raw captured inputs/outputs, expected/actual payload values, and
+free-form model explanations. Inconclusive JUnit results are errors rather than
+successful skips. Report generation makes no provider calls.
 
-## Source-First Install
+**Repeated trials:** select 2–20 compatible terminal experiments to inspect
+pass/fail/unknown counts, resolved coverage, and missing-evidence bounds. Every
+selected trial contributes to the result. These bounds describe unresolved
+evidence; they are not statistical confidence intervals.
 
-This repository is the source distribution. There is no external installer flow
-in this tree.
+Read the [evaluation guide](./src/evaluations/README.md) for rule semantics,
+versioning, model grading, and repeated-trial requirements.
 
-Use the local checkout directly:
+## Shared projects
+
+Team mode gives colleagues a shared workspace for captured traces, notes, and
+deterministic checks. It runs as a **separate service with its own database**.
 
 ```bash
-bun install --frozen-lockfile
-bun run dev
+bun run build
+bun src/index.ts team serve
 ```
 
-The daemon, React UI, SQLite schema, CLI, MCP server, examples, tests, and build
-scripts are present in this tree. Core capture and inspection do not depend on a
-closed Run Phantom service. Optional OpenAI, Anthropic, Claude Code, and Codex
-features still depend on those third-party providers or locally installed tools.
+Open **[http://127.0.0.1:5949/team](http://127.0.0.1:5949/team)**. On first launch,
+read the setup code from `~/.runphantom/team/bootstrap.code`, create the owner
+account, and create a project.
 
-## Development Checks
+| Role | Project access |
+| --- | --- |
+| **Viewer** | Inspect traces, notes, metrics, and saved checks. |
+| **Editor** | Viewer access, plus authored notes and deterministic checks. |
+| **Admin** | Editor access, plus members, invitations, ingestion keys, and audit history. |
+
+Project ingestion keys grant write-only trace ingestion. Saved checks retain
+frozen evidence and results even when the original live trace changes or is
+deleted. Local replay and machine commands stay in the local debugger process.
+
+For network sharing, configure a dedicated HTTPS origin and explicitly trusted
+reverse-proxy peers. The [team service guide](./src/team/README.md) covers the
+exporter endpoint, setup codes, roles, deployment, backups, and storage limits.
+
+## Configuration and CLI
+
+| Setting | Purpose | Default |
+| --- | --- | --- |
+| `RUNPHANTOM_PORT` | Local daemon port; setting it requires that exact port | `5947` when available |
+| `RUNPHANTOM_BIND_HOST` | Local daemon bind address | `127.0.0.1` |
+| `RUNPHANTOM_UI_PORT` | Development UI port | `5948` |
+| `RUNPHANTOM_DB_PATH` | Local SQLite file | `~/.runphantom/runphantom.db` |
+| `RUNPHANTOM_URL` | Daemon URL for MCP and supporting scripts | `http://127.0.0.1:5947` |
+
+Use exported shell variables for daemon overrides. The
+[environment reference](./.env.example) explains local settings, provider keys,
+and the permission controls for optional local agent sessions. Team configuration
+is documented separately in the [team guide](./src/team/README.md).
+
+```bash
+bun x runphantom-dev --help   # All commands and daemon settings
+bun x runphantom-dev serve    # Foreground daemon
+bun x runphantom-dev status   # Daemon health
+bun x runphantom-dev setup    # Configure supported agent integrations
+bun x runphantom-dev mcp      # MCP server over stdio
+```
+
+Build the UI first when using daemon commands from a fresh checkout. Optional
+AI features use your configured provider credentials or authenticated local
+agent CLI; core trace inspection and deterministic checks need neither.
+
+## Development
+
+The daemon, React UI, SQLite schema, CLI, MCP tools, examples, and tests are all
+in this repository.
 
 ```bash
 bun run build
 bun run test
 bun run lint
 bun x tsc --noEmit
+(cd app && bun x tsc --noEmit)
 ```
 
-For the UI package:
+For provider integrations, follow the [example setup guides](./examples/README.md).
+`bun run dev:examples` starts its own daemon and example suite; stop the regular
+development server first. Individual examples may need additional runtimes.
 
-```bash
-cd app
-bun x tsc --noEmit
-bun run build
-```
-
-## Examples
-
-The `examples/` directory contains single-file demo apps that exercise the
-local daemon, trace ingestion, and replay flow from different SDKs and runtimes.
-
-```bash
-bun run dev:examples
-```
+See the [agent and contributor guide](./AGENTS.md) for repository conventions
+and verification requirements.
 
 ## Documentation
 
-- [Agent guide](./AGENTS.md) — build, test, and contribution rules for this repository
-- [Third-party notices](./THIRD_PARTY_NOTICES.md)
-
-The CLI is self-documenting: `bun x runphantom-dev --help` lists every
-subcommand, and `.env.example` documents every environment variable with the
-source location that reads it.
+| Guide | What you will find |
+| --- | --- |
+| [Example applications](./examples/README.md) | Instrumentation and runnable integrations across languages. |
+| [Replay setup](./skills/setup-agent-replay/SKILL.md) | Project-owned replay endpoints and configuration. |
+| [Application verification](./src/verification/README.md) | Connected browser sessions, outcomes, and saved flows. |
+| [Regression evaluations](./src/evaluations/README.md) | Datasets, frozen evidence, grading, reports, and repeated trials. |
+| [Shared team service](./src/team/README.md) | Accounts, project roles, ingestion, deployment, and operational limits. |
+| [Environment reference](./.env.example) | Local configuration and optional provider features. |
+| [Research and source audit](./RESEARCH.md) | Inspected architecture references and the limits of the comparison evidence. |
 
 ## License
 
-MIT, copyright Divyam Talwar. See [`LICENSE`](./LICENSE) for the notice and
-terms that must be retained in copies and substantial portions of the software.
-Third-party names referenced in this repository remain the property of their
-respective owners; see [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+Run Phantom is owned and maintained by **Divyam Talwar** and released under the
+[MIT license](./LICENSE). Retain its copyright and permission notice in copies
+and substantial portions of the software. See
+[third-party notices](./THIRD_PARTY_NOTICES.md) for dependency and trademark notes.
