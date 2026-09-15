@@ -78,14 +78,20 @@ export function parseRule(value: unknown): Rule {
       return { kind: "output", operation: obj.operation as "equals" | "contains" | "notContains", value: text };
     }
     case "json": fields(obj, ["kind"], "JSON rule"); return { kind: "json" };
-    case "jsonPath": {
-      fields(obj, ["kind", "path", "equals"], "JSON path rule");
+    case "jsonPath": case "toolArgument": {
+      fields(obj, obj.kind === "toolArgument" ? ["kind", "name", "path", "equals", "match"] : ["kind", "path", "equals"], "JSON path rule");
       const path = boundedText(obj.path, "JSON path", 1024, true);
       expectation(path);
       const parts = path === "" ? [] : path.split(".");
       if (parts.length > 32 || parts.some((part) => !part || unsafe.has(part) || isSensitiveKey(part))) error("JSON path contains an unsupported or credential-bearing segment");
       if (!Object.hasOwn(obj, "equals")) error("JSON path rule requires equals");
       expectation(obj.equals);
+      if (obj.kind === "toolArgument") {
+        const name = boundedText(obj.name, "tool name");
+        expectation(name);
+        if (obj.match !== "any" && obj.match !== "all") error("tool argument matching must be any or all");
+        return { kind: "toolArgument", name, path, equals: obj.equals, match: obj.match };
+      }
       return { kind: "jsonPath", path, equals: obj.equals };
     }
     case "tools": {

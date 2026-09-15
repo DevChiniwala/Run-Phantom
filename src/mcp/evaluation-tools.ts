@@ -1,4 +1,6 @@
 import { ErrorCode, McpError, type Tool } from "@modelcontextprotocol/sdk/types.js";
+import { parseDatasetExport, parseDatasetUpdate } from "../evaluations/validation";
+import { parseTrialSelection } from "../evaluations/trials";
 
 const text = { type: "string", minLength: 1, maxLength: 128 };
 const version = { type: "integer", minimum: 1, maximum: 20 };
@@ -8,6 +10,7 @@ const rule = { oneOf: [
   object({ kind: { const: "json" } }, ["kind"]),
   object({ kind: { const: "jsonPath" }, path: { type: "string", maxLength: 1024 }, equals: {} }, ["kind", "path", "equals"]),
   object({ kind: { const: "tools" }, operation: { enum: ["required", "forbidden", "sequence"] }, names: { type: "array", minItems: 1, maxItems: 20, items: text } }, ["kind", "operation", "names"]),
+  object({ kind: { const: "toolArgument" }, name: text, path: { type: "string", maxLength: 1024 }, equals: {}, match: { enum: ["any", "all"], description: "any requires a proven matching call; all requires every named call to match. Zero calls fail; unavailable evidence remains inconclusive." } }, ["kind", "name", "path", "equals", "match"]),
   object({ kind: { const: "budget" }, metric: { enum: ["inputTokens", "outputTokens", "totalTokens", "durationMs", "costUsd", "toolCalls"] }, max: { type: "number", minimum: 0 } }, ["kind", "metric", "max"]),
   object({ kind: { const: "errors" }, max: { type: "integer", minimum: 0 } }, ["kind", "max"]),
   object({ kind: { const: "rubric" }, provider: { enum: ["openai", "anthropic"] }, model: text, rubric: { type: "string", minLength: 1, maxLength: 2000 }, threshold: { type: "number", minimum: 0, maximum: 1 } }, ["kind", "provider", "model", "rubric", "threshold"]),
@@ -17,7 +20,7 @@ const portable = object({ format: { const: "runphantom-evaluations/v1" }, name: 
 
 export const EVALUATION_TOOLS: Tool[] = [
   { name: "eval_dataset", description: "List/get/create/update/import/export/delete versioned regression datasets. Create requires name. Update requires datasetId, expectedVersion and complete cases; concurrent or stale revisions return409. Each case requires explicit rules; sourceRunId/sourceSpanId captures reference input/output, and input is an explicit manual override. Import data is the portable format and never restores trusted source identities. Deletion retains frozen experiment history. No executable evaluators.", inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["list", "get", "create", "update", "import", "export", "delete"] }, datasetId: text, name: text, version, expectedVersion: version, cases, data: portable }, additionalProperties: false } },
-  { name: "eval_run", description: "Snapshot a captured run, start an evaluation experiment, list/get jobs or cancel a job. snapshot requires runId and optional outputSpanId. start requires datasetId,name and assignments mapping EVERY revision case once to a captured candidate run. Inputs must match exactly except CRLF normalization; mismatch/unavailable yields inconclusive without model calls. Returns frozen pending/running results and a job id immediately; poll get until terminal. Model rubric calls require explicit allowModelJudges:true consent and send selected trace data externally. Omitted consent never authorizes model calls. This does not replay agents.", inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["snapshot", "start", "get", "list", "cancel"] }, runId: text, outputSpanId: text, experimentId: text, datasetId: text, version, name: text, assignments: { type: "array", minItems: 1, maxItems: 50, items: object({ caseId: text, runId: text, outputSpanId: text }, ["caseId", "runId"]) }, allowModelJudges: { type: "boolean" } }, additionalProperties: false } },
+  { name: "eval_run", description: "Snapshot a captured run, start an evaluation experiment, list/get jobs or cancel a job. analyze requires 2–20 distinct experimentIds with identical frozen definitions and distinct captured runs per case; returns observed outcomes and unresolved bounds, not a confidence interval, without rerunning anything. snapshot requires runId and optional outputSpanId. report requires experimentId and optional compatible baseline; returns a compact JSON report with a strict gate, without raw payloads or model explanations. start requires datasetId,name and assignments mapping EVERY revision case once to a captured candidate run. Inputs must match exactly except CRLF normalization; mismatch/unavailable yields inconclusive without model calls. Returns frozen pending/running results and a job id immediately; poll get until terminal. Model rubric calls require explicit allowModelJudges:true consent and send selected trace data externally. Omitted consent never authorizes model calls. This does not replay agents.", inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["snapshot", "start", "get", "list", "cancel", "report", "analyze"] }, experimentIds: { type: "array", minItems: 2, maxItems: 20, uniqueItems: true, items: text }, baseline: text, runId: text, outputSpanId: text, experimentId: text, datasetId: text, version, name: text, assignments: { type: "array", minItems: 1, maxItems: 50, items: object({ caseId: text, runId: text, outputSpanId: text }, ["caseId", "runId"]) }, allowModelJudges: { type: "boolean" } }, additionalProperties: false } },
   { name: "eval_compare", description: "Compare completed baseline and candidate experiments from the SAME dataset id/revision/hash, case membership and evaluator versions. Returns per-case regressions/improvements/inconclusive and candidate-minus-baseline token/duration/reported-cost deltas. Unknown metrics stay null. Incompatible experiments fail instead of weakening the comparison.", inputSchema: { type: "object", required: ["baseline", "candidate"], properties: { baseline: text, candidate: text }, additionalProperties: false } },
   { name: "eval_review", description: "List append-only human reviews or create a human pass/fail review for a case in an experiment. Human reviews are separate from code/model verdicts and never overwrite automatic scores. create requires experimentId,caseId,rating and optional note.", inputSchema: { type: "object", required: ["action", "experimentId"], properties: { action: { enum: ["list", "create"] }, experimentId: text, caseId: text, rating: { enum: ["pass", "fail"] }, note: { type: "string", maxLength: 2000 } }, additionalProperties: false } },
 ];
@@ -49,6 +52,11 @@ async function request(url: string, path: string, method = "GET", body?: unknown
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
+function datasetRequestBody(value: unknown, portable = false) {
+  try { return portable ? parseDatasetExport(value) : parseDatasetUpdate(value); }
+  catch (error) { throw new McpError(ErrorCode.InvalidParams, error instanceof Error ? error.message : "Invalid evaluation dataset"); }
+}
+
 export async function callEvaluationTool(name: string, args: Record<string, unknown>, backendUrl: string) {
   const tool = EVALUATION_TOOLS.find(item => item.name === name);
   if (!tool) return undefined;
@@ -66,11 +74,11 @@ export async function callEvaluationTool(name: string, args: Record<string, unkn
         case "update": {
           const expectedVersion = optionalVersion(args, "expectedVersion");
           if (expectedVersion === undefined || !Array.isArray(args.cases)) throw new McpError(ErrorCode.InvalidParams, "expectedVersion and cases are required");
-          return request(backendUrl, `/datasets/${id("datasetId")}`, "PUT", { expectedVersion, cases: args.cases });
+          return request(backendUrl, `/datasets/${id("datasetId")}`, "PUT", datasetRequestBody({ expectedVersion, cases: args.cases }));
         }
         case "import": {
           if (!args.data || typeof args.data !== "object" || Array.isArray(args.data)) throw new McpError(ErrorCode.InvalidParams, "data must be a portable dataset object");
-          return request(backendUrl, "/datasets/import", "POST", args.data);
+          return request(backendUrl, "/datasets/import", "POST", datasetRequestBody(args.data, true));
         }
         case "delete": return request(backendUrl, `/datasets/${id("datasetId")}`, "DELETE");
         default: throw new McpError(ErrorCode.InvalidParams, "action must be list/get/create/update/import/export/delete");
@@ -78,16 +86,23 @@ export async function callEvaluationTool(name: string, args: Record<string, unkn
     }
     case "eval_run": {
       switch (args.action) {
+        case "analyze": {
+          let experimentIds: string[];
+          try { experimentIds = parseTrialSelection({ experimentIds: args.experimentIds }); }
+          catch (error) { throw new McpError(ErrorCode.InvalidParams, error instanceof Error ? error.message : "Invalid trial selection"); }
+          return request(backendUrl, "/analyses/repeated-trials", "POST", { experimentIds });
+        }
         case "list": return request(backendUrl, "/experiments");
         case "snapshot": return request(backendUrl, `/runs/${id("runId")}/snapshot${args.outputSpanId === undefined ? "" : `?outputSpanId=${id("outputSpanId")}`}`);
         case "get": return request(backendUrl, `/experiments/${id("experimentId")}`);
+        case "report": return request(backendUrl, `/experiments/${id("experimentId")}/report${args.baseline === undefined ? "" : `?${new URLSearchParams({ baseline: required(args, "baseline") })}`}`);
         case "cancel": return request(backendUrl, `/experiments/${id("experimentId")}/cancel`, "POST");
         case "start": {
           if (!Array.isArray(args.assignments) || !args.assignments.length) throw new McpError(ErrorCode.InvalidParams, "assignments must map every case to a candidate run");
           if (args.allowModelJudges !== undefined && typeof args.allowModelJudges !== "boolean") throw new McpError(ErrorCode.InvalidParams, "allowModelJudges must be boolean");
           return request(backendUrl, "/experiments", "POST", { datasetId: required(args, "datasetId"), name: required(args, "name"), version: optionalVersion(args, "version"), assignments: args.assignments, ...(args.allowModelJudges === undefined ? {} : { allowModelJudges: args.allowModelJudges }) });
         }
-        default: throw new McpError(ErrorCode.InvalidParams, "action must be snapshot/start/get/list/cancel");
+        default: throw new McpError(ErrorCode.InvalidParams, "action must be snapshot/start/get/list/cancel/report/analyze");
       }
     }
     case "eval_compare": return request(backendUrl, `/compare?${new URLSearchParams({ baseline: required(args, "baseline"), candidate: required(args, "candidate") })}`);

@@ -46,7 +46,10 @@ describe("evaluation snapshot provenance", () => {
     expect(snapshot.metrics.errorSpans).toBeNull();
     expect(snapshot.metrics.durationMs).toBe(99);
     const selected = snapshotRun(run, [root(), span("generation", { attributes: null, unavailable: { input: false, output: false, attributes: true } })], "generation");
-    expect(evaluateRule({ kind: "output", operation: "equals", value: "answer" }, selected).status).toBe("pass");
+    // Selecting a span restores its text, but cannot restore withheld completion evidence.
+    expect(selected.output.value).toBe("answer");
+    expect(selected.metrics.durationMs).toBe(99);
+    expect(evaluateRule({ kind: "output", operation: "equals", value: "answer" }, selected).status).toBe("inconclusive");
   });
   test("clipped tool identities are explicitly unavailable for name and order assertions", () => {
     const snapshot = snapshotRun(run, [root(), span("tool", { span_type: "TOOL_CALL", name: "A".repeat(129) })]);
@@ -197,7 +200,7 @@ describe("declarative evaluation rules", () => {
       [{ kind: "output", operation: "contains", value: '"items"' }, "pass"], [{ kind: "output", operation: "notContains", value: "absent" }, "pass"],
       [{ kind: "output", operation: "equals", value: "wrong" }, "fail"],
     ];
-    for (const [rule, status] of rules) expect(evaluateRule(rule, snapshot)).toMatchObject({ status, source: "code", evaluatorVersion: "code:1", spanIds: ["root"] });
+    for (const [rule, status] of rules) expect(evaluateRule(rule, snapshot)).toMatchObject({ status, source: "code", evaluatorVersion: "code:2", spanIds: ["root"] });
     expect(evaluateRule({ kind: "json" }, complete()).status).toBe("fail");
     expect(evaluateRule({ kind: "output", operation: "equals", value: "" }, snapshotRun(run, [root({ output_payload: "" })])).status).toBe("pass");
   });

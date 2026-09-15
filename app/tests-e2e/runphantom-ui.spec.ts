@@ -172,12 +172,97 @@ test("Run Phantom UI: span tree and side panel render the seeded trace", async (
   await expect(page.getByText(/Fix the typo in README\.md/).first()).toBeVisible({ timeout: 5_000 });
 });
 
+test("Run Phantom UI: run header actions never cover the run title or status", async ({ page, runPhantom }) => {
+  await seedRunPhantomFixtures(runPhantom.url);
+
+  const overlaps = (a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }) =>
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+  // The actions group used to be flex-shrink-0 beside a shrinkable title, so at
+  // common laptop widths it overflowed leftwards across the status chip and
+  // squeezed the title to nothing.
+  for (const viewport of [{ width: 1024, height: 720 }, { width: 1280, height: 720 }, { width: 1440, height: 900 }, { width: 1920, height: 1080 }]) {
+    await page.setViewportSize(viewport);
+    await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+
+    const header = page.locator("[data-run-header]");
+    const status = header.locator("[data-run-status]");
+    await expect(status).toHaveText(/^Run (?:live|failed|complete)$/, { timeout: 10_000 });
+    const actions = header.locator("[data-run-actions]");
+    await expect(actions.getByRole("button", { name: "Annotate" })).toBeVisible();
+
+    const title = status.locator("xpath=preceding-sibling::*[1]");
+    const titleWidth = await title.evaluate((element) => element.getBoundingClientRect().width);
+    expect(titleWidth, `title width at ${viewport.width}px`).toBeGreaterThanOrEqual(48);
+
+    const statusBox = (await status.boundingBox())!;
+    const titleBox = (await title.boundingBox())!;
+    const controlBoxes = await actions.locator(":scope > button, :scope > a, :scope > div").evaluateAll((elements) =>
+      elements.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { label: element.textContent?.trim() || element.getAttribute("aria-label") || "", x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      }).filter((box) => box.width > 0 && box.height > 0),
+    );
+    expect(controlBoxes.length).toBeGreaterThan(0);
+    for (const control of controlBoxes) {
+      expect(overlaps(control, statusBox), `"${control.label}" covers the status at ${viewport.width}px`).toBe(false);
+      expect(overlaps(control, titleBox), `"${control.label}" covers the title at ${viewport.width}px`).toBe(false);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth), `horizontal overflow at ${viewport.width}px`).toBe(viewport.width);
+  }
+});
+
+test("Run Phantom UI: a trajectory tooltip never covers the bar it describes", async ({ page, runPhantom }) => {
+  const replay = await fetch(`${runPhantom.url}/api/demo-traces/replay`, { method: "POST" });
+  expect(replay.ok).toBe(true);
+
+  // The tooltip is up to 480px tall. When it fit neither below nor above the bar
+  // it was clamped to the top of the viewport, over the bar, so the bar could no
+  // longer be clicked while its own tooltip was open.
+  for (const viewport of [{ width: 1280, height: 720 }, { width: 1024, height: 640 }, { width: 1920, height: 1080 }]) {
+    await page.setViewportSize(viewport);
+    await page.goto(`${runPhantom.url}/runs/demo_review`);
+    await expect(page.locator("[data-run-status]")).toHaveText(/^Run (?:live|failed)$/, { timeout: 20_000 });
+
+    // The review demo streams seven trajectory spans; wait for all of them so a
+    // bar cannot mount mid-loop and shift the layout under the hover.
+    // Narrow error spans render as a triangle button instead of a labelled bar.
+    const bars = page.locator('button.timeline-bar, button[aria-label^="Jump to "]');
+    await expect.poll(async () => bars.count(), { timeout: 20_000 }).toBe(7);
+    const count = await bars.count();
+    for (let index = 0; index < count; index++) {
+      const bar = bars.nth(index);
+      await bar.scrollIntoViewIfNeeded();
+      await bar.hover();
+      const tooltip = page.locator("[data-span-tooltip]");
+      await expect(tooltip).toBeVisible();
+      const barBox = (await bar.boundingBox())!;
+      const tipBox = (await tooltip.boundingBox())!;
+      const label = `${await bar.getAttribute("aria-label")} at ${viewport.width}x${viewport.height}`;
+      const intersects = barBox.x < tipBox.x + tipBox.width && tipBox.x < barBox.x + barBox.width
+        && barBox.y < tipBox.y + tipBox.height && tipBox.y < barBox.y + barBox.height;
+      expect(intersects, `tooltip covers ${label}`).toBe(false);
+      expect(tipBox.y, `tooltip top inside viewport for ${label}`).toBeGreaterThanOrEqual(0);
+      expect(tipBox.y + tipBox.height, `tooltip bottom inside viewport for ${label}`).toBeLessThanOrEqual(viewport.height);
+      const hitsBar = await bar.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return !!hit && element.contains(hit);
+      });
+      expect(hitsBar, `bar centre is clickable while its tooltip is open: ${label}`).toBe(true);
+      await page.mouse.move(2, viewport.height - 2);
+      await expect(tooltip).toBeHidden();
+    }
+  }
+});
+
 test("Run Phantom UI: download exports the selected trace as JSON", async ({ page, runPhantom }) => {
   await seedRunPhantomFixtures(runPhantom.url);
 
-  const detailResponse = await fetch(`${runPhantom.url}/api/runs/detail/${FIXTURE_PRIMARY_RUN_ID}`);
+  const detailResponse = await fetch(`${runPhantom.url}/api/runs/${FIXTURE_PRIMARY_RUN_ID}/export`);
   expect(detailResponse.ok).toBe(true);
   const expectedTrace = await detailResponse.json();
+  expect(expectedTrace.format).toBe("runphantom-trace/v1");
 
   await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
   const downloadButton = page.getByRole("button", { name: /^download$/i });

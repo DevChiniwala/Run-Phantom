@@ -1,0 +1,65 @@
+import { useState } from "react";
+import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { downloadTeamJson, projectApi, projectPath, type Check, type CheckReport, type CheckSummary, type DeterministicRule, type RunSummary } from "../api/team";
+import { buildRule, emptyRule, ruleLabel, type RuleDraft } from "../components/evaluations/RuleEditor";
+import { useProject, useTeam, useTeamPages, useTeamQuery } from "./context";
+import { Action, Badge, DateTime, Empty, ErrorNotice, Evidence, Field, Heading, Input, Loading, More, Select, Textarea, useDebouncedValue, useTask } from "./common";
+
+export function ChecksPage() { return <Routes><Route index element={<CheckList />} /><Route path="new" element={<NewCheck />} /><Route path=":checkId" element={<CheckDetail />} /></Routes>; }
+function CheckList() {
+  const project = useProject(); const checks = useTeamPages<CheckSummary>([project.id, "checks"], `${projectApi(project.id)}/checks`);
+  const items = checks.data?.pages.flatMap(page => page.items) ?? [];
+  return <div className="team-page"><Heading title="Saved checks" action={project.role !== "viewer" && <Link className="team-text-link" to={`${projectPath(project.id)}/checks/new`}>Create check</Link>}>Deterministic checks preserve their reference, candidate evidence and machine results.</Heading><ErrorNotice error={checks.error} retry={() => void checks.refetch()} />{checks.isPending && <Loading />}
+    {!checks.error && <div className="team-list">{items.map(check => <Link className="team-row team-row-link" key={check.id} to={`${projectPath(project.id)}/checks/${encodeURIComponent(check.id)}`}><div><strong>{check.name}</strong><p className="team-muted">{check.author.email} · <DateTime value={check.createdAt} /> · {check.counts.total} candidates</p></div><Badge value={check.status} /></Link>)}</div>}
+    {!checks.isPending && !checks.error && !items.length && <Empty title="Make expectations explicit"><p>Save a reference trace, choose candidate captures and define deterministic rules. Missing evidence stays inconclusive.</p>{project.role === "viewer" ? <p>An editor or admin can create a check for this project.</p> : <Link to={`${projectPath(project.id)}/checks/new`}>Create your first check</Link>}</Empty>}<More available={checks.hasNextPage} busy={checks.isFetchingNextPage} onClick={() => void checks.fetchNextPage()} />
+  </div>;
+}
+
+function NewCheck() {
+  const project = useProject();
+  return project.role === "viewer" ? <div className="team-page"><Empty title="Editor access required"><p>Viewers can inspect saved checks. Ask a project admin for permission to create one.</p><Link to={`${projectPath(project.id)}/checks`}>View saved checks</Link></Empty></div> : <CheckForm />;
+}
+function CheckForm() {
+  const project = useProject(); const { client } = useTeam(); const navigate = useNavigate(); const task = useTask();
+  const [name, setName] = useState(""); const [reference, setReference] = useState(""); const [candidates, setCandidates] = useState<string[]>([]); const [q, setQ] = useState(""); const [rules, setRules] = useState<RuleDraft[]>([emptyRule()]);
+  const settledQuery = useDebouncedValue(q);
+  const runs = useTeamPages<RunSummary>([project.id, "check-runs"], `${projectApi(project.id)}/runs`, { q: settledQuery });
+  return <div className="team-page"><Link className="team-text-link" to={`${projectPath(project.id)}/checks`}>← Saved checks</Link><div className="team-section"><Heading title="Create a deterministic check">Choose captured runs with the same input. Results and evidence are frozen when you save.</Heading><form className="team-form" onSubmit={event => { event.preventDefault(); void task.run(async () => {
+    if (!reference || !candidates.length) throw new Error("Choose a reference trace and at least one candidate.");
+    const compiled = rules.map(draft => { const rule = buildRule(draft); if (rule.kind === "rubric") throw new Error("Team checks support deterministic rules only."); return rule; });
+    return client.request<Check>(`${projectApi(project.id)}/checks`, { method: "POST", body: { name, referenceRunId: reference, candidateRunIds: candidates, rules: compiled } });
+  }, check => navigate(`${projectPath(project.id)}/checks/${encodeURIComponent(check.id)}`)); }}>
+    <div className="team-narrow"><Field label="Check name"><Input required value={name} maxLength={128} onChange={event => setName(event.target.value)} placeholder="Support answer requirements" /></Field></div>
+    <section><h2>Captured runs</h2><div className="team-narrow mt-3"><Field label="Find captured runs"><Input value={q} maxLength={256} onChange={event => setQ(event.target.value)} placeholder="Search this project's captures" /></Field></div><ErrorNotice error={runs.error} retry={() => void runs.refetch()} />{runs.isPending && <Loading />}
+      <p className="team-muted my-3">Reference: {reference || "not selected"} · {candidates.length}/10 candidates</p><div className="team-selection">{!runs.error && runs.data?.pages.flatMap(page => page.items).map(run => <div className="team-row" key={run.id}><div className="px-3"><strong>{run.displayName || run.name}</strong><p className="team-muted">{run.id}</p></div><div className="team-inline"><label><input type="radio" name="reference" aria-label={`Reference ${run.name}`} checked={reference === run.id} onChange={() => setReference(run.id)} />Reference</label><label><input type="checkbox" aria-label={`Candidate ${run.name}`} checked={candidates.includes(run.id)} disabled={candidates.length >= 10 && !candidates.includes(run.id)} onChange={event => setCandidates(previous => event.target.checked ? [...previous, run.id] : previous.filter(id => id !== run.id))} />Candidate</label></div></div>)}</div>
+      <More available={runs.hasNextPage} busy={runs.isFetchingNextPage} onClick={() => void runs.fetchNextPage()} />{candidates.length > 0 && <Action onClick={() => setCandidates([])}>Clear candidates</Action>}
+    </section><section className="team-narrow"><h2>Expected behavior</h2>{rules.map((draft, index) => <TeamRuleEditor key={index} draft={draft} index={index} onChange={value => setRules(previous => previous.map((item, i) => i === index ? value : item))} onRemove={rules.length > 1 ? () => setRules(previous => previous.filter((_, i) => i !== index)) : undefined} />)}<Action disabled={rules.length >= 8} onClick={() => setRules(previous => [...previous, emptyRule()])}>Add rule</Action></section>
+    <ErrorNotice error={task.error} /><p className="team-muted">Up to 10 candidates and 8 rules. Large captures may exceed this check's evidence limit; they are rejected without saving a partial result.</p><Action primary type="submit" disabled={task.busy}>{task.busy ? "Evaluating captured evidence…" : "Save and evaluate check"}</Action>
+  </form></div></div>;
+}
+
+function TeamRuleEditor({ draft, index, onChange, onRemove }: { draft: RuleDraft; index: number; onChange: (value: RuleDraft) => void; onRemove?: () => void }) {
+  const change = <K extends keyof RuleDraft>(key: K, value: RuleDraft[K]) => onChange({ ...draft, [key]: value });
+  return <fieldset className="team-check-rule" aria-label={`Rule ${index + 1}`}><legend>Rule {index + 1}</legend><Field label="Rule type"><Select value={draft.kind} onChange={event => onChange({ ...draft, kind: event.target.value as DeterministicRule["kind"], operation: event.target.value === "tools" ? "required" : "equals" })}><option value="output">Output text</option><option value="json">Valid JSON</option><option value="jsonPath">JSON value</option><option value="tools">Tool calls</option><option value="toolArgument">Tool argument</option><option value="budget">Usage budget</option><option value="errors">Recorded errors</option></Select></Field>
+    {draft.kind === "output" && <><Field label="Text condition"><Select value={draft.operation} onChange={event => change("operation", event.target.value)}><option value="equals">Equals</option><option value="contains">Contains</option><option value="notContains">Does not contain</option></Select></Field><Field label="Expected text"><Textarea maxLength={4096} value={draft.value} onChange={event => change("value", event.target.value)} /></Field></>}
+    {draft.kind === "json" && <p className="team-muted">The captured output must be valid JSON. Missing output is inconclusive.</p>}
+    {draft.kind === "toolArgument" && <><Field label="Tool name"><Input required maxLength={128} value={draft.name} onChange={event => change("name", event.target.value)} /></Field><Field label="Matching calls"><Select value={draft.match} onChange={event => change("match", event.target.value as "any" | "all")}><option value="all">Every call</option><option value="any">At least one call</option></Select></Field></>}
+    {(draft.kind === "toolArgument" || draft.kind === "jsonPath") && <><Field label="JSON property path" hint="Separate property names with dots. Leave empty for the whole value."><Input maxLength={1024} value={draft.path} onChange={event => change("path", event.target.value)} /></Field><Field label="Expected JSON value"><Textarea maxLength={4096} value={draft.expected} onChange={event => change("expected", event.target.value)} /></Field></>}
+    {draft.kind === "tools" && <><Field label="Tool condition"><Select value={draft.operation} onChange={event => change("operation", event.target.value)}><option value="required">Required</option><option value="forbidden">Forbidden</option><option value="sequence">Ordered subsequence</option></Select></Field><Field label="Tool names" hint="One name per line."><Textarea value={draft.names} onChange={event => change("names", event.target.value)} maxLength={4096} /></Field></>}
+    {draft.kind === "budget" && <Field label="Budget metric"><Select value={draft.metric} onChange={event => change("metric", event.target.value as RuleDraft["metric"])}>{["inputTokens", "outputTokens", "totalTokens", "durationMs", "costUsd", "toolCalls"].map(metric => <option key={metric} value={metric}>{metric}</option>)}</Select></Field>}
+    {(draft.kind === "budget" || draft.kind === "errors") && <Field label={draft.kind === "errors" ? "Maximum errors" : "Maximum"} hint="Unreported measurements remain inconclusive."><Input type="number" min={0} step="any" required value={draft.max} onChange={event => change("max", event.target.value)} /></Field>}
+    {onRemove && <Action onClick={onRemove}>Remove rule {index + 1}</Action>}
+  </fieldset>;
+}
+
+function CheckDetail() {
+  const project = useProject(); const { client } = useTeam(); const { checkId = "" } = useParams(); const task = useTask(); const base = `${projectApi(project.id)}/checks/${encodeURIComponent(checkId)}`;
+  const check = useTeamQuery<Check>([project.id, "check", checkId], base);
+  return <div className="team-page"><Link className="team-text-link" to={`${projectPath(project.id)}/checks`}>← Saved checks</Link><ErrorNotice error={check.error} retry={() => void check.refetch()} />{check.isPending && <Loading />}
+    {check.data && !check.error && <div className="team-section"><Heading title={check.data.name} action={<Action disabled={task.busy} onClick={() => void task.run(() => client.request<CheckReport>(`${base}/report`), report => downloadTeamJson(report, `runphantom-team-check-${checkId}.json`))}>Download check report</Action>}><Badge value={check.data.status} /> · {check.data.author.email} · <DateTime value={check.data.createdAt} /></Heading><ErrorNotice error={task.error} />
+      <dl className="team-facts">{Object.entries(check.data.counts).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl><p className="team-muted">Frozen reference: {check.data.referenceRunId} · Evaluator v{check.data.evaluationVersion} · Snapshot v{check.data.snapshotVersion}</p><p className="team-muted">Reports include verdicts and bounded reasons. Captured payloads stay in the authorized workspace.</p>
+      <section className="team-section"><h2>Definition</h2><ol className="list-decimal pl-5 space-y-2">{check.data.definition.rules.map((rule, index) => <li key={index}>{ruleLabel(rule)}</li>)}</ol></section>
+      {check.data.results.map(result => <section className="team-section" key={result.runId}><div className="team-inline"><h2>Candidate <Link to={`${projectPath(project.id)}/traces/${encodeURIComponent(result.runId)}`}>{result.runId}</Link></h2><Badge value={result.status} /></div><p className="team-muted">Reference input: {result.inputMatch}</p>{result.ruleResults.map((rule, index) => <div className="team-note" key={index}><div className="team-inline"><Badge value={rule.status} /><strong>Rule {index + 1}</strong></div><p>{rule.reason}</p>{(rule.redacted || rule.truncated) && <p className="team-muted">Evidence was {rule.redacted ? "redacted" : "truncated"}.</p>}</div>)}<details><summary className="cursor-pointer py-3">Frozen candidate evidence</summary><Evidence title="Captured input" value={result.snapshot.input} /><Evidence title="Captured output" value={result.snapshot.output.value} unavailable={!result.snapshot.output.complete} /></details></section>)}
+    </div>}
+  </div>;
+}

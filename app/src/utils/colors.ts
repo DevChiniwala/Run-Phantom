@@ -24,13 +24,14 @@ export const C = {
   selectedBorder: "var(--rp-selected-border)",
 } as const;
 
+// No hue within 45 degrees of --rp-danger: a healthy tool bar must never read as
+// a failed one beside a real failure (pinned by tests/span-colors.test.ts).
 const SPAN_COLORS = [
   "oklch(45% 0.12 152)", "oklch(48% 0.13 76)",
-  "oklch(47% 0.18 31)", "oklch(44% 0.12 224)",
-  "oklch(45% 0.16 259)", "oklch(43% 0.06 305)",
-  "oklch(50% 0.12 91)", "oklch(43% 0.10 185)",
-  "oklch(46% 0.14 282)", "oklch(45% 0.12 135)",
-  "oklch(46% 0.10 48)", "oklch(44% 0.12 208)",
+  "oklch(44% 0.12 224)", "oklch(45% 0.16 259)",
+  "oklch(43% 0.06 305)", "oklch(50% 0.12 91)",
+  "oklch(43% 0.10 185)", "oklch(46% 0.14 282)",
+  "oklch(45% 0.12 135)", "oklch(44% 0.12 208)",
 ];
 
 export function spanColor(name: string, map: Map<string, string>): string {

@@ -29,24 +29,34 @@ export interface ParsedSpan {
  * flat by design; a consumer that wants structure re-parses the string.
  */
 function anyValue(v: any): string | number | boolean | undefined {
+  const decoded = decodeAnyValue(v);
+  return decoded !== null && typeof decoded === "object" ? JSON.stringify(decoded) : decoded;
+}
+
+function decodeAnyValue(v: any): any {
   if (!v || typeof v !== "object") return undefined;
   if (v.stringValue !== undefined) return v.stringValue;
-  // int64 arrives as a string over JSON OTLP, so Number() is the coercion, not a cast.
-  if (v.intValue !== undefined) return Number(v.intValue);
-  if (v.doubleValue !== undefined) return v.doubleValue;
+  // Flattening rounded int64s or nonfinite doubles would certify invented
+  // numbers/nulls as captured arguments. Keep their unavailability explicit.
+  if (v.intValue !== undefined) {
+    const integer = Number(v.intValue);
+    return Number.isSafeInteger(integer) ? integer : "[UNAVAILABLE]";
+  }
+  if (v.doubleValue !== undefined) {
+    return typeof v.doubleValue === "number" && Number.isFinite(v.doubleValue) ? v.doubleValue : "[UNAVAILABLE]";
+  }
   if (v.boolValue !== undefined) return v.boolValue;
   if (v.arrayValue !== undefined) {
-    const items = (v.arrayValue.values ?? []).map(anyValue).filter((x: unknown) => x !== undefined);
-    return JSON.stringify(items);
+    return (v.arrayValue.values ?? []).map(decodeAnyValue);
   }
   if (v.kvlistValue !== undefined) {
-    const obj: Record<string, unknown> = {};
+    const obj: Record<string, unknown> = Object.create(null);
     for (const kv of v.kvlistValue.values ?? []) {
       if (typeof kv?.key !== "string") continue;
-      const inner = anyValue(kv.value);
+      const inner = decodeAnyValue(kv.value);
       if (inner !== undefined) obj[kv.key] = inner;
     }
-    return JSON.stringify(obj);
+    return obj;
   }
   if (v.bytesValue !== undefined) {
     return typeof v.bytesValue === "string" ? v.bytesValue : String(v.bytesValue);
@@ -93,6 +103,17 @@ function inferSpanType(
   if (hasToolName) return "TOOL_CALL";
   if (traceloopKind === "tool") return "TOOL_CALL";
   if (traceloopKind === "llm") return "LLM_GENERATION";
+  switch (attrs["openinference.span.kind"]) {
+    case "LLM": return "LLM_GENERATION";
+    case "TOOL": return "TOOL_CALL";
+    case "AGENT": return "AGENT_ROOT";
+    case "CHAIN": return "TRACE";
+    case "EMBEDDING": case "RETRIEVER": case "RERANKER":
+    case "GUARDRAIL": case "EVALUATOR": case "PROMPT": return "INTERNAL";
+  }
+  if (attrs["gen_ai.operation.name"] === "execute_tool") return "TOOL_CALL";
+  if (attrs["gen_ai.operation.name"] === "invoke_agent") return "AGENT_ROOT";
+  if (attrs["gen_ai.operation.name"] === "invoke_workflow") return "TRACE";
   if (isGenAiInferenceSpan(attrs)) return "LLM_GENERATION";
   if (typeof attrs["lk.chat_ctx"] === "string") return "LLM_GENERATION";
   if (typeof operationId === "string") {
@@ -130,10 +151,8 @@ function hasIndexedAttr(attrs: Record<string, string | number | boolean>, prefix
 }
 
 function status(code: number | string | undefined): string {
-  // proto3 JSON mapping allows an enum to appear as either its number or its
-  // name, and the official exporters emit the name. Matching only on the number
-  // meant STATUS_CODE_ERROR fell through to the UNSET default below and a failed
-  // span was stored as OK — the one thing a trace debugger must never get wrong.
+  // OTLP JSON requires numeric enums. Also accept named enums from exporters
+  // using generic protobuf JSON so their errors do not silently become OK.
   if (typeof code === "string") {
     const name = code.toUpperCase();
     if (name === "STATUS_CODE_ERROR" || name === "ERROR") return "ERROR";
@@ -223,7 +242,7 @@ export function parseOtlpRequest(body: any): ParsedSpan[] {
         // `deployment.environment` and the instrumentation scope never reached
         // the span — the fields you need to tell two services apart in one trace.
         // Least-specific first: a span attribute of the same key still wins.
-        const allAttrs: Record<string, string | number | boolean> = {};
+        const allAttrs: Record<string, string | number | boolean> = Object.create(null);
         collectAttrs(rs.resource?.attributes, allAttrs);
         collectAttrs(ss.scope?.attributes, allAttrs);
         if (typeof ss.scope?.name === "string" && ss.scope.name) {
@@ -245,8 +264,10 @@ export function parseOtlpRequest(body: any): ParsedSpan[] {
         const operationId = getAttr(attrs, "ai.operationId") as string | undefined;
         const traceloopKind = getAttr(attrs, "traceloop.span.kind") as string | undefined;
         const runPhantomSpanKind = getAttr(attrs, "runphantom.span.kind") as string | undefined;
-        const toolCallName = first(attrs, "ai.toolCall.name", "tool.name", "lk.function_tool.name") as string | undefined;
-        const spanType = inferSpanType(operationId, traceloopKind, !!toolCallName, runPhantomSpanKind, allAttrs);
+        const legacyToolName = first(attrs, "ai.toolCall.name", "tool.name", "lk.function_tool.name");
+        const spanType = inferSpanType(operationId, traceloopKind, typeof legacyToolName === "string" && !!legacyToolName, runPhantomSpanKind, allAttrs);
+        const toolName = legacyToolName ?? (spanType === "TOOL_CALL" ? getAttr(attrs, "gen_ai.tool.name") : undefined);
+        const toolCallName = typeof toolName === "string" && toolName ? toolName : undefined;
 
         // For tool calls, prefer the actual tool name over generic wrapper
         // span names like "ai.toolCall" or Traceloop's "foo.tool".
@@ -275,19 +296,21 @@ export function parseOtlpRequest(body: any): ParsedSpan[] {
         // middleware or otel-instrumented HTTP calls — so the "raw view" tab
         // still has something to render.
         if (inputPayload === undefined && outputPayload === undefined) {
-          inputPayload = first(attrs, "runphantom.input", "traceloop.entity.input", "tool.input") as string | undefined;
-          outputPayload = first(attrs, "runphantom.output", "traceloop.entity.output", "tool.output") as string | undefined;
+          inputPayload = first(attrs, "runphantom.input", "traceloop.entity.input", "tool.input", "input.value") as string | undefined;
+          if (!match.outputUnavailable) {
+            outputPayload = first(attrs, "runphantom.output", "traceloop.entity.output", "tool.output", "output.value") as string | undefined;
+          }
         }
 
-        const model = first(attrs, "gen_ai.response.model", "ai.response.model", "gen_ai.request.model", "ai.model.id", "llm.request.model") as string | undefined;
-        const provider = first(attrs, "gen_ai.provider.name", "ai.model.provider", "gen_ai.system", "llm.system") as string | undefined;
-        const inputTokens = first(attrs, "ai.usage.inputTokens", "ai.usage.promptTokens", "ai.usage.prompt_tokens", "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens") as number | undefined;
-        const outputTokens = first(attrs, "ai.usage.outputTokens", "ai.usage.completionTokens", "ai.usage.completion_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens") as number | undefined;
+        const model = first(attrs, "gen_ai.response.model", "ai.response.model", "llm.response.model_name", "gen_ai.request.model", "ai.model.id", "llm.request.model", "llm.model_name", "llm.request.model_name") as string | undefined;
+        const provider = first(attrs, "gen_ai.provider.name", "ai.model.provider", "gen_ai.system", "llm.provider", "llm.system") as string | undefined;
+        const inputTokens = first(attrs, "ai.usage.inputTokens", "ai.usage.promptTokens", "ai.usage.prompt_tokens", "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens", "llm.token_count.prompt") as number | undefined;
+        const outputTokens = first(attrs, "ai.usage.outputTokens", "ai.usage.completionTokens", "ai.usage.completion_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens", "llm.token_count.completion") as number | undefined;
 
         const eventId = first(attrs, "ai.telemetry.metadata.runphantom.eventId", "runphantom.event.id", "traceloop.association.properties.event_id") as string | undefined;
         const eventName = first(attrs, "ai.telemetry.metadata.runphantom.eventName", "runphantom.event.name", "traceloop.association.properties.event_name") as string | undefined;
-        const userId = first(attrs, "ai.telemetry.metadata.runphantom.userId", "runphantom.user.id", "traceloop.association.properties.user_id") as string | undefined;
-        const convoId = first(attrs, "ai.telemetry.metadata.runphantom.convoId", "runphantom.conversation.id", "traceloop.association.properties.convo_id") as string | undefined;
+        const userId = first(attrs, "ai.telemetry.metadata.runphantom.userId", "runphantom.user.id", "traceloop.association.properties.user_id", "user.id") as string | undefined;
+        const convoId = first(attrs, "ai.telemetry.metadata.runphantom.convoId", "runphantom.conversation.id", "traceloop.association.properties.convo_id", "gen_ai.conversation.id", "session.id") as string | undefined;
         // Replay exporters echo this stitch key so the received trace replaces
         // the placeholder created when replay began.
         let replayRunId = first(

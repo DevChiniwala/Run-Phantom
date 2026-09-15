@@ -5,9 +5,11 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Field, Select } from "../components/verification/PredicateEditor";
 import { DatasetEditor } from "../components/evaluations/DatasetEditor";
+import { RepeatedTrials } from "../components/evaluations/RepeatedTrials";
 import { StartExperiment, ExperimentResults, CompareExperiments } from "../components/evaluations/Experiments";
 import { textareaClass } from "../components/evaluations/RuleEditor";
 import { evaluationsApi, type DatasetRevision, type Experiment } from "../api/evaluations";
+import { LossyJsonNumberError, parseJsonEvidence } from "../../../src/evaluations/json-evidence";
 
 export function EvaluationsPage() {
   const [params] = useSearchParams();
@@ -29,7 +31,7 @@ export function EvaluationsPage() {
   async function perform(work: () => Promise<void>) { if (busyRef.current) return; busyRef.current = true; setBusy(true); setError(""); try { await work(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not complete this operation."); } finally { busyRef.current = false; setBusy(false); } }
   function saved(next: DatasetRevision) { queryClient.setQueryData(["evaluations", "revision", next.datasetId, next.version], next); setSelectedDataset(next.datasetId); setVersion(next.version); void queryClient.invalidateQueries({ queryKey: ["evaluations", "datasets"] }); setNotice(`Saved ${next.datasetName}, revision ${next.version}.`); }
   function started(next: Experiment) { queryClient.setQueryData(["evaluations", "experiment", next.id], next); setSelectedExperiment(next.id); void queryClient.invalidateQueries({ queryKey: ["evaluations", "experiments"] }); setNotice(`Experiment ${next.name} started. Results update as checks finish.`); }
-  async function importJson(value: string) { if (new TextEncoder().encode(value).byteLength > 2 * 1024 * 1024) throw new Error("Dataset import exceeds 2 MiB."); let parsed: unknown; try { parsed = JSON.parse(value); } catch { throw new Error("Dataset import is not valid JSON."); } saved(await evaluationsApi.importDataset(parsed)); setPortableJson(""); setNotice("Portable dataset imported. Local source identities were not imported."); }
+  async function importJson(value: string) { if (new TextEncoder().encode(value).byteLength > 2 * 1024 * 1024) throw new Error("Dataset import exceeds 2 MiB."); let parsed: unknown; try { parsed = parseJsonEvidence(value); } catch (cause) { if (cause instanceof LossyJsonNumberError) throw cause; throw new Error("Dataset import is not valid JSON."); } saved(await evaluationsApi.importDataset(parsed)); setPortableJson(""); setNotice("Portable dataset imported. Local source identities were not imported."); }
   const queryError = datasets.error ?? revision.error ?? experiments.error;
   return <div className="mx-auto min-h-full max-w-6xl space-y-7 p-5 pt-14 text-[color:var(--rp-ink)] sm:p-8 sm:pt-14 lg:pt-8">
     <header className="space-y-2"><h1 className="text-2xl font-semibold tracking-tight text-[color:var(--rp-ink-strong)]" style={{ fontFamily: "var(--font-display)" }}>Evaluations</h1><p className="max-w-2xl text-sm leading-relaxed text-[color:var(--rp-ink-soft)]">Turn captured agent behavior into repeatable regression cases. Compare frozen candidates against the same expectations, then add your own review.</p></header>
@@ -43,6 +45,7 @@ export function EvaluationsPage() {
     {revision.data && <div className="flex flex-wrap items-start gap-8"><div className="min-w-0 flex-[1_1_360px]"><DatasetEditor key={`${revision.data.datasetId}:${revision.data.version}`} revision={revision.data} latestVersion={dataset?.latestVersion ?? revision.data.version} initialRunId={params.get("runId") ?? ""} onSaved={saved} /></div><div className="min-w-0 flex-[1_1_360px]"><StartExperiment key={`${revision.data.datasetId}:${revision.data.version}`} revision={revision.data} onStarted={started} /></div></div>}
     <section aria-label="Saved experiments" className="space-y-4 border-t border-[color:var(--rp-border)] pt-5"><h2 className="text-sm font-semibold">Experiments and reviews</h2>{experiments.isLoading ? <p role="status" className="text-xs">Loading experiments…</p> : !experiments.data?.length ? <p className="text-xs text-[color:var(--rp-ink-soft)]">Start an experiment to retain automatic results, comparisons and separate human reviews.</p> : <Field label="View experiment"><Select value={selectedExperiment} onChange={event => setSelectedExperiment(event.target.value)}><option value="">Choose an experiment</option>{experiments.data.map(item => <option key={item.id} value={item.id}>{item.name} · {item.status} · r{item.datasetVersion}</option>)}</Select></Field>}{selectedExperiment && <ExperimentResults key={selectedExperiment} experimentId={selectedExperiment} />}</section>
     <CompareExperiments experiments={experiments.data ?? []} />
+    <RepeatedTrials experiments={experiments.data ?? []} onOpen={setSelectedExperiment} />
     {datasetId && <details><summary className="cursor-pointer text-xs text-[color:var(--rp-ink-muted)]">Dataset management</summary><div className="mt-3 space-y-2"><p className="text-xs text-[color:var(--rp-ink-soft)]">Deleting this dataset removes its revisions. Frozen experiments and human reviews remain available.</p><Button variant="outline" disabled={busy} onClick={() => void perform(async () => { await evaluationsApi.deleteDataset(datasetId); setSelectedDataset(""); setVersion(undefined); await queryClient.invalidateQueries({ queryKey: ["evaluations"] }); setNotice("Dataset deleted; frozen experiment history is retained."); })}>Delete selected dataset</Button></div></details>}
   </div>;
 }

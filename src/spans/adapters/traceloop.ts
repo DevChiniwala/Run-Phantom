@@ -133,24 +133,25 @@ function normalizeGenAiMessages(attrs: Record<string, string | number | boolean>
 }
 
 function normalizeCurrentGenAiMessages(attrs: Record<string, string | number | boolean>) {
-  const inputRaw = attrs["gen_ai.input.messages"] as string | undefined;
-  const outputRaw = attrs["gen_ai.output.messages"] as string | undefined;
-  const systemRaw = attrs["gen_ai.system_instructions"] as string | undefined;
+  const inputRaw = typeof attrs["gen_ai.input.messages"] === "string" ? attrs["gen_ai.input.messages"] : undefined;
+  const outputRaw = typeof attrs["gen_ai.output.messages"] === "string" ? attrs["gen_ai.output.messages"] : undefined;
+  const systemRaw = typeof attrs["gen_ai.system_instructions"] === "string" ? attrs["gen_ai.system_instructions"] : undefined;
   if (!inputRaw && !outputRaw && !systemRaw) return null;
 
   const input = parseJsonOrRaw(inputRaw);
   const output = parseJsonOrRaw(outputRaw);
   const system = parseJsonOrRaw(systemRaw);
 
-  const messages = Array.isArray(input)
+  const allMessages = Array.isArray(input)
     ? input.map(messageFromGenAiObject).filter((m): m is NormalizedMessage => !!m)
     : [];
-  const outputText = Array.isArray(output)
+  const messages = allMessages.filter((message) => message.role !== "system");
+  const outputText = Array.isArray(output) && output.some(genAiHasTextContent)
     ? output.map(genAiTextContent).filter(Boolean).join("\n\n")
     : typeof output === "string" ? output : undefined;
-  const systemPrompt = normalizeSystemInstructions(system);
+  const systemPrompt = [normalizeSystemInstructions(system), ...allMessages.filter((message) => message.role === "system").map((message) => message.content)].filter(Boolean).join("\n\n");
 
-  if (messages.length === 0 && !outputText && !systemPrompt) return null;
+  if (messages.length === 0 && outputText === undefined && !systemPrompt) return null;
   return {
     messages,
     systemPrompt,
@@ -245,8 +246,10 @@ function messageFromGenAiObject(value: unknown): NormalizedMessage | null {
   const obj = value as Record<string, unknown>;
   const role = typeof obj.role === "string" ? roleOrUnknown(obj.role) : "user";
   const content = genAiMessageContent(obj);
-  if (!content && role !== "tool") return null;
-  return { role, content, raw: value };
+  const parts = Array.isArray(obj.parts) ? obj.parts : Array.isArray(obj.content) ? obj.content : undefined;
+  if (!content && role !== "tool" && !parts?.length) return null;
+  const toolCallId = role === "tool" && parts?.length === 1 ? toolCallIdFromPart(parts[0]) : undefined;
+  return { role, content, ...(toolCallId !== undefined ? { toolCallId } : {}), raw: value };
 }
 
 function genAiMessageContent(value: unknown): string {
@@ -271,6 +274,7 @@ function genAiPartContent(part: unknown): string {
     });
   }
   if (obj.type === "tool_call_response" || obj.type === "tool_result") {
+    if (Object.hasOwn(obj, "response")) return typeof obj.response === "string" ? obj.response : JSON.stringify(obj.response) ?? "";
     if (typeof obj.result === "string") return obj.result;
     if (typeof obj.content === "string") return obj.content;
     return JSON.stringify(obj.result ?? obj.content ?? obj);
@@ -285,6 +289,20 @@ function genAiTextContent(value: unknown): string {
   const parts = Array.isArray(obj.parts) ? obj.parts : Array.isArray(obj.content) ? obj.content : undefined;
   if (!parts) return extractContent(obj.content ?? value);
   return parts.map(genAiTextPartContent).filter(Boolean).join("\n");
+}
+
+function genAiHasTextContent(value: unknown): boolean {
+  if (typeof value === "string") return true;
+  if (!value || typeof value !== "object") return false;
+  const obj = value as Record<string, unknown>;
+  const parts = Array.isArray(obj.parts) ? obj.parts : Array.isArray(obj.content) ? obj.content : undefined;
+  if (!parts) return typeof obj.content === "string" || typeof obj.text === "string";
+  return parts.some((part) => {
+    if (typeof part === "string") return true;
+    if (!part || typeof part !== "object") return false;
+    const item = part as Record<string, unknown>;
+    return item.type === "text" && (typeof item.content === "string" || typeof item.text === "string");
+  });
 }
 
 function genAiTextPartContent(part: unknown): string {

@@ -5,6 +5,7 @@ import { RunListItem } from "../components/RunList";
 import { RunDetail } from "../components/RunDetail";
 import { EmptyState } from "../components/EmptyState";
 import { ReplayView } from "../components/ReplayView";
+import { RunComparison } from "../components/RunComparison";
 import { useReplay } from "../hooks/use-replay";
 import { RotateCcw, ArrowRight, X, ChevronDown, ArrowLeft } from "lucide-react";
 import { C } from "../utils/colors";
@@ -480,6 +481,7 @@ export function RunsPage() {
                           )}
                         </div>
                       )}
+                      {meta && <RunComparison baselineRunId={meta.replay.sourceRunId} candidateRunId={selectedId} />}
                       <div className="flex-1 min-h-0 flex">
                         <div className="flex-1 min-w-0 overflow-auto sb">
                           <RunDetail runId={selectedId} routeBase="/runs" onForkStarted={handleFork} />

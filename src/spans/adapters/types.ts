@@ -40,6 +40,8 @@ export interface AdapterMatch {
    */
   inputPayload?: string;
   outputPayload?: string;
+  /** Recognized non-text output must not become final text through a raw payload fallback. */
+  outputUnavailable?: boolean;
 }
 
 /**

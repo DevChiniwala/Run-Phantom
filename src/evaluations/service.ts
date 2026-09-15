@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EVALUATION_VERSION, SNAPSHOT_VERSION, EVALUATION_LIMITS as L, type Rule, type RuleResult, type Status, type DatasetCase, type DatasetCaseDraft, type DatasetExport, type Experiment, type Comparison } from "./protocol";
 import { parseDatasetCreate, parseDatasetUpdate, parseDatasetExport, parseExperimentDraft, parseReviewDraft, parseId, EvaluationError } from "./validation";
 import { sanitizeInput, sanitizeSnapshotText } from "./snapshot";
-import { evaluateRule, boundRuleResult } from "./rules";
+import { evaluateRule, boundRuleResult, CODE_EVALUATOR_VERSION, TOOL_ARGUMENT_EVALUATOR_VERSION } from "./rules";
 import { evaluateRubric } from "./judge";
 import { loadSnapshot } from "./loader";
 import * as store from "./store";
@@ -20,7 +20,7 @@ function portableDataset(name: string, cases: DatasetCase[]): DatasetExport {
 }
 function pending(rule: Rule, reason = "Pending evaluation"): RuleResult {
   return boundRuleResult({ status: "inconclusive", source: rule.kind === "rubric" ? "llm" : "code",
-    evaluatorVersion: rule.kind === "rubric" ? "rubric:1" : "code:1", score: null, reason,
+    evaluatorVersion: rule.kind === "rubric" ? "rubric:1" : rule.kind === "toolArgument" ? TOOL_ARGUMENT_EVALUATOR_VERSION : CODE_EVALUATOR_VERSION, score: null, reason,
     actual: null, expected: rule, spanIds: [], redacted: false, truncated: false });
 }
 function aggregate(experiment: Experiment): void {

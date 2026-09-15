@@ -66,6 +66,56 @@ async function experiment(revision: DatasetRevision, runId: string, name: string
   throw new Error("Experiment did not finish");
 }
 
+test("MCP repeated trials matches HTTP and keeps failed and unavailable captures in its denominator", async () => {
+  const revision = await dataset();
+  const first = await experiment(revision, "baseline", "First trial");
+  seedRun("trial-failed", "declined"); seedRun("trial-unknown", "paid", "Different input");
+  const second = await experiment(revision, "trial-failed", "Second trial");
+  const third = await experiment(revision, "trial-unknown", "Third trial");
+  const experimentIds = [first.id, second.id, third.id];
+  const result = await call<import("../src/evaluations/trials").TrialAnalysis>("eval_run", { action: "analyze", experimentIds });
+  expect(result.summary).toMatchObject({ total: 3, pass: 1, fail: 1, inconclusive: 1, passRate: 1 / 3, resolvedCoverage: 2 / 3, unresolvedBounds: { lower: 1 / 3, upper: 2 / 3 } });
+  expect(result.gate.pass).toBe(false);
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/evaluations/analyses/repeated-trials`;
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ experimentIds }) });
+  expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("no-store"); expect(await response.json()).toEqual(result);
+  const duplicate = await experiment(revision, "baseline", "Re-graded first trial");
+  await expectError("eval_run", { action: "analyze", experimentIds: [first.id, duplicate.id] }, "same captured run");
+  await expectError("eval_run", { action: "analyze", experimentIds: [first.id, "missing"] }, "not found");
+  expect(JSON.stringify(result)).not.toContain("Complete checkout"); expect(JSON.stringify(result)).not.toContain("declined");
+});
+
+test("MCP report returns a strict gate without frozen payloads and rejects incompatible baselines", async () => {
+  const revision = await dataset();
+  const baseline = await experiment(revision, "baseline", "Report baseline");
+  seedRun("report-failed", "declined");
+  const failed = await experiment(revision, "report-failed", "Report failure");
+  const report = await call<import("../src/evaluations/report").EvaluationReport>("eval_run", { action: "report", experimentId: failed.id, baseline: baseline.id });
+  expect(report.format).toBe("runphantom-evaluation-report/v1");
+  expect(report.gate.pass).toBe(false);
+  expect(report.comparison?.summary.regressions).toBe(1);
+  expect(report.cases[0]).not.toHaveProperty("snapshot");
+  expect(JSON.stringify(report)).not.toContain("Complete checkout");
+  await expectError("eval_run", { action: "report", experimentId: failed.id, baseline: "missing" });
+});
+
+test("MCP tool-argument cases distinguish the same tool called for the wrong customer", async () => {
+  for (const [id, customer] of [["refund-good", "customer-1"], ["refund-wrong", "customer-2"]]) {
+    seedRun(id);
+    insertSpan({ id: `${id}-tool`, run_id: id, parent_span_id: `${id}-root`, name: "refund", span_type: "TOOL_CALL", status: "OK",
+      input_payload: JSON.stringify({ customer: { id: customer } }), output_payload: "{}", start_time_ms: 1020, end_time_ms: 1030, duration_ms: 10, attributes: "{}" });
+  }
+  const initial = await call<DatasetRevision>("eval_dataset", { action: "create", name: "Refund arguments" });
+  const revision = await call<DatasetRevision>("eval_dataset", { action: "update", datasetId: initial.datasetId, expectedVersion: 1,
+    cases: [{ name: "Refund correct customer", sourceRunId: "refund-good", rules: [{ kind: "toolArgument", name: "refund", path: "customer.id", equals: "customer-1", match: "all" }] }] });
+  const passing = await experiment(revision, "refund-good", "Correct refund");
+  const failing = await experiment(revision, "refund-wrong", "Wrong refund");
+  expect(passing.verdict).toBe("pass");
+  expect(failing.verdict).toBe("fail");
+  expect(failing.results[0].checks[0].evaluatorVersion).toBe("toolargs:1");
+  expect((await call<Comparison>("eval_compare", { baseline: passing.id, candidate: failing.id })).summary.regressions).toBe(1);
+});
+
 test("evaluation tools coexist with traces and verification; snapshots preserve selected output and missing metrics", async () => {
   const listed = await client.listTools();
   const names = listed.tools.map(tool => tool.name);

@@ -203,7 +203,7 @@ describe("evaluation workbench backend", () => {
     const next = s.updateDataset(revision.datasetId, { expectedVersion: 2, cases: [{ id: revision.cases[0].id, name: "Changed", input: "Question", rules: [outputRule] }] });
     const incompatible = await terminal(s, start(s, next, "good").id);
     expect(() => s.compare(baseline.id, incompatible.id)).toThrow("identical dataset");
-    const tampered = structuredClone(candidate); tampered.results[0].checks[0].evaluatorVersion = "code:2";
+    const tampered = structuredClone(candidate); tampered.results[0].checks[0].evaluatorVersion = "code:999";
     getDrizzleDb().$client.query("UPDATE evaluation_experiments SET data=? WHERE id=?").run(JSON.stringify(tampered), candidate.id);
     expect(() => s.compare(baseline.id, candidate.id)).toThrow("evaluator versions");
   });
@@ -295,6 +295,36 @@ describe("evaluation workbench backend", () => {
       expect((await request("/datasets", { name: "x".repeat(L.MAX_REQUEST) })).status).toBe(413);
       expect((await request(`/datasets/${id}`, undefined, "DELETE")).status).toBe(204);
       expect((await request(`/datasets/${id}`)).status).toBe(404);
+    } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+  });
+  test("daemon rejects numeric expectations that would change during JSON parsing", async () => {
+    const { createServer } = await import("../src/server");
+    const { server } = await createServer(0);
+    server.listen(0, "127.0.0.1"); await once(server, "listening");
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/evaluations`;
+    try {
+      const created = await fetch(`${base}/datasets`, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"name":"Numeric evidence"}' });
+      expect(created.status).toBe(201);
+      const { datasetId } = await created.json() as { datasetId: string };
+      const malformed = await fetch(`${base}/datasets`, { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"name":"' + '\\"'.repeat(65_536) });
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toEqual({ error: "invalid JSON body" });
+      const body = (token: string, version = 1) => `{"expectedVersion":${version},"cases":[{"name":"Amount","input":"Question","rules":[{"kind":"toolArgument","name":"refund","path":"amount","match":"all","equals":${token}}]}]}`;
+      for (const encoding of ["utf8", "utf16le"] as const) {
+        for (const token of ["1e400", "1e-400", "9007199254740993", "0.1234567890123456789"]) {
+          const response = await fetch(`${base}/datasets/${datasetId}`, { method: "PUT", headers: { "Content-Type": `application/json; charset=${encoding === "utf8" ? "utf-8" : "utf-16le"}` }, body: Buffer.from(body(token), encoding) });
+          expect(response.status).toBe(400);
+          expect(await response.json()).toEqual({ error: "JSON numbers must be representable without rounding, underflow or overflow." });
+        }
+      }
+      let version = 1;
+      for (const token of ["0.1", "1.00", "1e3", '"1e400"']) {
+        const response = await fetch(`${base}/datasets/${datasetId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: body(token, version++) });
+        expect(response.status).toBe(201);
+        const revision = await response.json() as { version: number; cases: Array<{ rules: Array<{ equals: unknown }> }> };
+        expect(revision.version).toBe(version);
+        expect(revision.cases[0].rules[0].equals).toEqual(JSON.parse(token));
+      }
     } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
   });
   test("daemon rejects non-JSON control bodies before the general 50MiB protobuf parser", async () => {

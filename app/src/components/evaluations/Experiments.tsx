@@ -57,6 +57,17 @@ export function ExperimentResults({ experimentId }: { experimentId: string }) {
     <p className="text-xs text-[color:var(--rp-ink-soft)]">{data.datasetName} · revision {data.datasetVersion} · {data.summary.pass} / {data.summary.total} cases passed ({measurement(data.summary.passRate * 100, "%")}). {data.summary.fail} failed; {data.summary.inconclusive} inconclusive. All assigned cases count toward the pass rate.</p>
     {(error || data.error) && <p role="alert" className="text-xs text-[color:var(--rp-danger)]">{error || data.error}</p>}
     {notice && <p role="status" className="text-xs">{notice}</p>}
+    <div className="flex flex-wrap gap-2">
+      {(["json", "junit"] as const).map(format => <Button key={format} size="sm" variant="outline" disabled={busy} onClick={() => void perform(async () => {
+        const blob = await evaluationsApi.report(data.id, format);
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url; anchor.download = `evaluation-${data.id}.${format === "junit" ? "junit.xml" : "json"}`; anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setNotice("Report downloaded. Failed, incomplete and inconclusive results do not pass the quality gate.");
+      })}>Download {format === "junit" ? "JUnit" : "JSON"} report</Button>)}
+    </div>
+    <p className="text-xs text-[color:var(--rp-ink-soft)]">Reports include case verdicts and a strict quality gate. Captured prompts, responses and model explanations stay in the local workspace.</p>
     {active && <Button variant="outline" disabled={busy} onClick={() => void perform(async () => { await evaluationsApi.cancel(data.id); await experiment.refetch(); setNotice("Cancellation requested. Finished checks remain; unfinished checks are inconclusive."); })}>Cancel experiment</Button>}
     {data.results.map(result => { const latestReview = orderedReviews.find(review => review.caseId === result.caseId); return <article key={result.caseId} aria-label={`${result.caseName}: ${result.status}`} className="space-y-3 border-t border-[color:var(--rp-border)] pt-4"><div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold">{result.caseName}</h3><Verdict status={result.status} /></div>
       <p className="text-xs" style={{ color: result.inputMatch === "match" ? "var(--rp-ink-soft)" : "var(--rp-warning)" }}>{result.inputMatch === "match" ? "Candidate input matches the frozen reference." : result.inputMatch === "mismatch" ? "Input mismatch: candidate and reference inputs differ. No model judge was called for this case." : "Input unavailable: exact comparison is impossible. No model judge was called for this case."}</p>

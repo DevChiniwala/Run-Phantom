@@ -28,6 +28,8 @@ import { aiSdkLlmAdapter, aiSdkToolAdapter } from "./adapters/ai-sdk";
 import { rawPromptLlmAdapter } from "./adapters/raw-prompt";
 import { livekitLlmAdapter, livekitToolAdapter } from "./adapters/livekit";
 import { traceloopLlmAdapter, traceloopToolAdapter } from "./adapters/traceloop";
+import { openInferenceLlmAdapter, openInferenceToolAdapter } from "./adapters/openinference";
+import { genAiMetadataAdapter, genAiToolAdapter } from "./adapters/gen-ai";
 
 const ADAPTERS: SpanAdapter[] = [
   aiSdkLlmAdapter,
@@ -37,6 +39,10 @@ const ADAPTERS: SpanAdapter[] = [
   aiSdkToolAdapter,
   livekitToolAdapter,
   traceloopToolAdapter,
+  openInferenceLlmAdapter,
+  openInferenceToolAdapter,
+  genAiToolAdapter,
+  genAiMetadataAdapter,
 ];
 
 export function normalizeSpan(input: AdapterInput): AdapterMatch {

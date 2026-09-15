@@ -114,7 +114,7 @@ function convertAnyValue(v: any): any {
   if (v.boolValue !== undefined || v.value === "boolValue") return { boolValue: v.boolValue ?? false };
   if (v.intValue !== undefined || v.value === "intValue") return { intValue: String(v.intValue ?? 0) };
   if (v.doubleValue !== undefined || v.value === "doubleValue") return { doubleValue: v.doubleValue ?? 0 };
-  if (v.bytesValue !== undefined || v.value === "bytesValue") return { stringValue: bytesToHex(v.bytesValue) ?? "" };
+  if (v.bytesValue !== undefined || v.value === "bytesValue") return { bytesValue: Buffer.from(v.bytesValue ?? []).toString("base64") };
   if (v.arrayValue !== undefined || v.value === "arrayValue") {
     return { arrayValue: { values: (v.arrayValue?.values ?? []).map(convertAnyValue) } };
   }
@@ -134,20 +134,28 @@ function convertSpan(s: any): any {
     spanId: bytesToHex(s.spanId) ?? "",
     parentSpanId: bytesToHex(s.parentSpanId),
     traceState: s.traceState,
+    flags: s.flags,
     name: s.name ?? "",
     kind: typeof s.kind === "number" ? s.kind : 0,
     startTimeUnixNano: String(s.startTimeUnixNano ?? "0"),
     endTimeUnixNano: String(s.endTimeUnixNano ?? "0"),
     attributes: (s.attributes ?? []).map(convertKeyValue),
+    droppedAttributesCount: s.droppedAttributesCount,
+    droppedEventsCount: s.droppedEventsCount,
+    droppedLinksCount: s.droppedLinksCount,
     events: (s.events ?? []).map((e: any) => ({
       timeUnixNano: String(e.timeUnixNano ?? "0"),
       name: e.name ?? "",
       attributes: (e.attributes ?? []).map(convertKeyValue),
+      droppedAttributesCount: e.droppedAttributesCount,
     })),
     links: (s.links ?? []).map((l: any) => ({
       traceId: bytesToHex(l.traceId) ?? "",
       spanId: bytesToHex(l.spanId) ?? "",
+      traceState: l.traceState,
+      flags: l.flags,
       attributes: (l.attributes ?? []).map(convertKeyValue),
+      droppedAttributesCount: l.droppedAttributesCount,
     })),
     status: s.status
       ? { code: typeof s.status.code === "number" ? s.status.code : 0, message: s.status.message }
@@ -164,12 +172,15 @@ export function decodeOtlpProtobuf(buf: Buffer | Uint8Array): { resourceSpans: a
     oneofs: true,
   });
   const resourceSpans = (obj.resourceSpans ?? []).map((rs: any) => ({
+    schemaUrl: rs.schemaUrl,
     resource: rs.resource
-      ? { attributes: (rs.resource.attributes ?? []).map(convertKeyValue) }
+      ? { attributes: (rs.resource.attributes ?? []).map(convertKeyValue), droppedAttributesCount: rs.resource.droppedAttributesCount }
       : { attributes: [] },
     scopeSpans: (rs.scopeSpans ?? []).map((ss: any) => ({
+      schemaUrl: ss.schemaUrl,
       scope: ss.scope
-        ? { name: ss.scope.name ?? "", version: ss.scope.version }
+        ? { name: ss.scope.name ?? "", version: ss.scope.version,
+          attributes: (ss.scope.attributes ?? []).map(convertKeyValue), droppedAttributesCount: ss.scope.droppedAttributesCount }
         : undefined,
       spans: (ss.spans ?? []).map(convertSpan),
     })),
