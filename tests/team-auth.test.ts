@@ -12,7 +12,7 @@ describe("team configuration and credentials", () => {
     const config = loadTeamConfig({});
     expect(config.port).toBe(5949);
     expect(config.bindHost).toBe("127.0.0.1");
-    expect(config.dataDir.endsWith("/.runphantom/team")).toBe(true);
+    expect(config.dataDir.endsWith(path.join(".runphantom", "team"))).toBe(true);
     expect(() => loadTeamConfig({RUNPHANTOM_TEAM_PORT:"5949junk"})).toThrow();
     expect(() => validateTeamConfig({...config,bindHost:"0.0.0.0"})).toThrow();
     expect(() => validateTeamConfig({...config,bindHost:"0.0.0.0",publicOrigin:"https://team.example"})).toThrow();

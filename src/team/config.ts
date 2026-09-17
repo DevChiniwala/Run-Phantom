@@ -69,8 +69,9 @@ function owner(stats: fs.Stats): void {
 export function prepareTeamDirectory(directory: string): string {
   // Validate every existing directory before mkdir can follow a user-supplied symlink.
   const absolute = path.resolve(directory);
-  const parts = absolute.split(path.sep).filter(Boolean);
-  let current = path.parse(absolute).root;
+  const root = path.parse(absolute).root;
+  const parts = absolute.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
   for (const part of parts) {
     current = path.join(current, part);
     if (!fs.existsSync(current)) { fs.mkdirSync(current, { mode: 0o700 }); continue; }
