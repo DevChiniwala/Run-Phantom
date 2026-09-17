@@ -449,12 +449,15 @@ export async function queryTracesBounded(
 export const _queryTracesInternal = { assertReadOnlyTraceQuery };
 
 export function closeDb(): void {
+  _drizzleDb = null;
   if (_sqliteDb) {
     _sqliteDb.close();
     _sqliteDb = null;
   }
-  _drizzleDb = null;
   _dbPath = null;
+  // Bun on Windows can retain Drizzle's native SQLite handles until collection.
+  // Release them at this explicit lifecycle boundary so profiles can be removed.
+  if (process.platform === "win32") Bun.gc(true);
 }
 
 export function upsertRun(run: { id: string; event_id?: string; name?: string; event_name?: string; user_id?: string; convo_id?: string; started_at: number; last_updated_at: number; metadata?: string }) {
