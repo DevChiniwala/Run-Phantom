@@ -46,7 +46,7 @@
     "build:ui": "cd app && bun x vite build",
     "build:bun": "bun scripts/build-bun.ts",
     "build:bun:all": "bun scripts/build-bun.ts --all",
-    "dev": "bun run link-dev && bun --watch src/index.ts serve & (printf \"\\nRun Phantom UI: http://localhost:${RUNPHANTOM_UI_PORT:-5948}\\n\\n\" && cd app && bun x vite --force) & wait",
+    "dev": "bun run link-dev && bun scripts/dev.ts",
     "link-dev": "bun scripts/link-dev.ts",
     "postinstall": "bun run link-dev",
     "dev:server": "bun --watch src/index.ts serve",
