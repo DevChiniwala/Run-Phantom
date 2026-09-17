@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "bun --cwd openai-chat run check && bun --cwd anthropic-chat run check"
+    "check": "bun run --cwd openai-chat check && bun run --cwd anthropic-chat check"
   }
 }
