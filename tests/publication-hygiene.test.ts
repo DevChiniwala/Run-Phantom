@@ -99,10 +99,10 @@ describe("publication hygiene", () => {
       bin?: Record<string, string>;
     };
     const targets = new Set([...Object.values(pkg.bin ?? {}), "install.sh", "scripts/install.sh"]);
-    const result = Bun.spawnSync(["git", "ls-files", "--stage", "--", ...targets], { cwd: ROOT });
+    const result = Bun.spawnSync(["git", "ls-files", "--stage", "-z", "--", ...targets], { cwd: ROOT });
     expect(result.exitCode).toBe(0);
-    const executable = new Set(result.stdout.toString().split(/\r?\n/)
-      .filter(line => line.startsWith("100755 "))
+    const executable = new Set(result.stdout.toString().split("\0")
+      .filter(line => /^100755 [0-9a-f]+ 0\t/.test(line))
       .map(line => line.slice(line.indexOf("\t") + 1)));
     const notExecutable = [...targets].filter(rel => !executable.has(rel));
     expect(notExecutable).toEqual([]);
