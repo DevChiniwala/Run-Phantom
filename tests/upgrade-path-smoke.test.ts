@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -46,12 +46,12 @@ function fixture() {
     cleanup: () => rmSync(directory, { recursive: true, force: true }),
   };
 }
-async function run(f: ReturnType<typeof fixture>, port: number) {
+async function run(f: ReturnType<typeof fixture>, port: number, commandPath = process.env.PATH!) {
   const child = spawn("/bin/bash", [script], {
     cwd: root,
     detached: true,
     env: {
-      PATH: process.env.PATH!, HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME,
+      PATH: commandPath, HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME,
       TMPDIR: f.directory, PORT: String(port), RUNPHANTOM_BASELINE_BINARY: f.baseline,
       OPENAI_API_KEY: "synthetic-provider-canary", ANTHROPIC_API_KEY: "synthetic-provider-canary",
       RUNPHANTOM_SECRET_STORE_PATH: path.join(f.directory, "must-not-use-secrets.json"),
@@ -75,7 +75,13 @@ async function run(f: ReturnType<typeof fixture>, port: number) {
     const [code, signal] = await once(child, "close");
     if (timedOut) throw new Error(`Upgrade smoke harness timed out:\n${output}`);
     return { code, signal, output };
-  } finally { clearTimeout(timer); clearTimeout(forceKill); }
+  } finally {
+    clearTimeout(timer); clearTimeout(forceKill);
+    if (timedOut && child.pid !== undefined) {
+      // A timed-out shell may exit before its descendants release their handles.
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already exited. */ }
+    }
+  }
 }
 async function unrelatedProcess() {
   const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "ignore"] });
@@ -116,7 +122,7 @@ if (process.argv[2] === "stop") process.kill(${unrelated.child.pid}, "SIGTERM");
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); f.cleanup(); }
   }, testTimeout);
 
-  for (const failure of ["startup", "seed", "stubborn-seed"] as const) {
+  for (const failure of ["startup", "seed", "stubborn-seed", "slow-stubborn-seed"] as const) {
     test(`${failure} failure removes only owned state and foreground process`, async () => {
       const f = fixture(), unrelated = await unrelatedProcess();
       try {
@@ -129,14 +135,21 @@ fs.writeFileSync(${JSON.stringify(f.snapshot)}, JSON.stringify({
   bindHost: process.env.RUNPHANTOM_BIND_HOST, chat: process.env.RUNPHANTOM_CLAUDE_CLI_CHAT,
   hasProvider: !!(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY),
 }));
-${failure === "stubborn-seed" ? 'process.on("SIGTERM", () => {});' : ""}
+${failure.includes("stubborn") ? 'process.on("SIGTERM", () => {});' : ""}
 ${failure === "startup" ? "process.exit(37);" : `Bun.serve({ hostname: "127.0.0.1", port: Number(process.env.RUNPHANTOM_PORT), fetch(req) {
   return new URL(req.url).pathname === "/health"
     ? Response.json({ pid: process.pid, status: "ok" })
     : new Response("intentional fixture failure", { status: 500 });
 } });`}
 `);
-        const result = await run(f, await freePort());
+        let commandPath = process.env.PATH!;
+        if (failure === "slow-stubborn-seed") {
+          const bin = path.join(f.directory, "slow-commands");
+          mkdirSync(bin);
+          writeFileSync(path.join(bin, "sleep"), "#!/bin/sh\nexec /bin/sleep 0.3\n", { mode: 0o700 });
+          commandPath = `${bin}${path.delimiter}${commandPath}`;
+        }
+        const result = await run(f, await freePort(), commandPath);
         expect(result.code).toBe(1);
         expect(f.commands()).toEqual(["--version", "serve"]);
         const snapshot = JSON.parse(readFileSync(f.snapshot, "utf8")) as {

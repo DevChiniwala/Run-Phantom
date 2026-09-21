@@ -87,7 +87,8 @@ stop_owned_daemon() {
   [ -n "$pid" ] || return 0
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
-    for _ in {1..50}; do
+    local deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ]; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.1
     done
@@ -111,6 +112,8 @@ start_owned_daemon() {
 
 cleanup() {
   local status=$?
+  # Once cleanup owns shutdown, repeated interrupts must not abandon its child.
+  trap '' INT TERM
   set +e
   stop_owned_daemon
   if [ "$status" -ne 0 ] && [ -n "$DAEMON_LOG" ] && [ -f "$DAEMON_LOG" ]; then tail -100 "$DAEMON_LOG" >&2; fi
