@@ -175,9 +175,9 @@ describe("evaluation workbench backend", () => {
     run(); const revision = dataset(s, [outputRule, rubric]);
     const queued = start(s, revision, "candidate", true);
     const fetchRequest = globalThis.fetch;
-    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((input, init) => fetchRequest(
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => fetchRequest(
       typeof input === "string" && input.startsWith("/") ? new URL(input, base) : input, init,
-    ));
+    ), { preconnect: fetchRequest.preconnect }));
     try {
       await until(gate.calls, (calls) => calls === 1);
       const cancelled = await evaluationsApi.cancel(queued.id);
