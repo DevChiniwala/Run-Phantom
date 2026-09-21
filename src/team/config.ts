@@ -76,9 +76,10 @@ export function prepareTeamDirectory(directory: string): string {
     current = path.join(current, part);
     if (!fs.existsSync(current)) { fs.mkdirSync(current, { mode: 0o700 }); continue; }
     const stat = fs.lstatSync(current);
-    // System-owned aliases such as /var on macOS are outside the user trust boundary.
+    // Only POSIX ownership can establish a system alias such as /var on macOS.
+    // Windows reports uid zero without proving system ownership of a junction.
     if (stat.isSymbolicLink()) {
-      if (stat.uid !== 0 || current === absolute) throw new TeamError("invalid_request", "Team data paths cannot contain user-owned symbolic links");
+      if (process.platform === "win32" || stat.uid !== 0 || current === absolute) throw new TeamError("invalid_request", "Team data paths cannot contain user-owned symbolic links");
     } else if (!stat.isDirectory()) throw new TeamError("invalid_request", "Team data path must be a directory");
   }
   const real = fs.realpathSync(absolute);

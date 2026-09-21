@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,6 +46,43 @@ describe("team data directory traversal", () => {
       fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
       expect(() => prepareTeamDirectory(link)).toThrow("symbolic links");
       expect(fs.readFileSync(path.join(target, "canary"), "utf8")).toBe("unchanged");
+    });
+  });
+
+  test("Windows uid zero does not grant an ancestor junction system-alias trust", () => {
+    fixture(root => {
+      const target = path.join(root, "original");
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, "canary"), "unchanged");
+      const link = path.join(root, "linked-parent");
+      fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      const realLstat = fs.lstatSync;
+      const statSpy = spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, options?: unknown) => {
+        const stat = realLstat(candidate, options as Parameters<typeof fs.lstatSync>[1]);
+        if (String(candidate) === link) Object.defineProperty(stat, "uid", { value: 0 });
+        return stat;
+      }) as typeof fs.lstatSync);
+      try {
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        expect(() => prepareTeamDirectory(path.join(link, "team"))).toThrow("symbolic links");
+        expect(fs.existsSync(path.join(target, "team"))).toBe(false);
+        expect(fs.readFileSync(path.join(target, "canary"), "utf8")).toBe("unchanged");
+      } finally {
+        statSpy.mockRestore();
+        Object.defineProperty(process, "platform", platform);
+      }
+    });
+  });
+
+  test.skipIf(process.platform !== "win32")("native Windows rejects ancestor junctions before creating team state", () => {
+    fixture(root => {
+      const target = path.join(root, "outside-team");
+      fs.mkdirSync(target);
+      const link = path.join(root, "ancestor");
+      fs.symlinkSync(target, link, "junction");
+      expect(() => prepareTeamDirectory(path.join(link, "team"))).toThrow("symbolic links");
+      expect(fs.readdirSync(target)).toEqual([]);
     });
   });
 });
