@@ -41,19 +41,19 @@ jobs:
       # no app/, tests/ or scripts/ yet — and a gate that fails on their absence
       # reports a red build for work that is simply not there yet.
       - name: Typecheck (app)
-        run: '[ -d app ] && (cd app && bun x tsc --noEmit) || echo "no app/ in this tree — skipped"'
+        run: 'if [ -d app ]; then (cd app && bun x tsc --noEmit); else echo "no app/ in this tree — skipped"; fi'
 
       - name: Lint
         run: bun x eslint .
 
       - name: Test
-        run: '[ -d tests ] && bun test tests/ || echo "no tests/ in this tree — skipped"'
+        run: 'if [ -d tests ]; then bun test tests/; else echo "no tests/ in this tree — skipped"; fi'
 
       - name: Check embedded migrations are current
-        run: '[ -f scripts/embed-migrations.ts ] && bun scripts/embed-migrations.ts --check || echo "no scripts/ in this tree — skipped"'
+        run: 'if [ -f scripts/embed-migrations.ts ]; then bun scripts/embed-migrations.ts --check; else echo "no scripts/ in this tree — skipped"; fi'
 
       - name: Build UI
-        run: '[ -f app/vite.config.ts ] && (cd app && bun x vite build) || echo "no app/ in this tree — skipped"'
+        run: 'if [ -f app/vite.config.ts ]; then (cd app && bun x vite build); else echo "no app/ in this tree — skipped"; fi'
 
 # The Playwright suite under app/ is intentionally not wired here yet. It has
 # only ever been run locally against a seeded daemon, so adding it now would
