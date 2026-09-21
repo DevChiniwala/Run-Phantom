@@ -16,7 +16,7 @@ export function linkDevCommand(
   fs.rmSync(`${command}.cmd`, { force: true });
 
   if (platform === "win32") {
-    const entry = path.relative(binDir, path.join(repoRoot, "src", "index.ts"));
+    const entry = path.win32.relative(binDir, path.join(repoRoot, "src", "index.ts"));
     fs.writeFileSync(
       `${command}.cmd`,
       [

@@ -11,51 +11,66 @@ export function devCommands(repoRoot = REPO_ROOT) {
   ];
 }
 
-async function main(): Promise<void> {
-  const processes = devCommands().map((command) => ({
-    ...command,
-    process: Bun.spawn({
-      cmd: command.cmd,
-      cwd: command.cwd,
-      env: process.env,
-      stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
-    }),
-  }));
-
-  console.log(`\nRun Phantom UI: http://localhost:${process.env.RUNPHANTOM_UI_PORT ?? "5948"}\n`);
+export async function runDev(commands = devCommands(), shutdownTimeout = 5_000): Promise<void> {
+  const processes: { label: string; process: Bun.Subprocess }[] = [];
+  const useProcessGroups = process.platform !== "win32";
+  const signalChild = (child: Bun.Subprocess, signal: NodeJS.Signals) => {
+    try {
+      if (useProcessGroups) process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch { /* already stopped */ }
+  };
+  const isRunning = (child: Bun.Subprocess) => {
+    if (!useProcessGroups) return child.exitCode === null;
+    try { process.kill(-child.pid, 0); return true; } catch { return false; }
+  };
 
   let stopping = false;
   const stop = async (signal: NodeJS.Signals, exitCode: number) => {
     if (stopping) return;
     stopping = true;
-    for (const child of processes) {
-      try { child.process.kill(signal); } catch { /* already stopped */ }
+    for (const child of processes) signalChild(child.process, signal);
+    const deadline = Date.now() + shutdownTimeout;
+    // A launcher can exit before its descendants, so wait on the entire group.
+    while (processes.some(child => isRunning(child.process)) && Date.now() < deadline) {
+      await Bun.sleep(Math.min(25, Math.max(0, deadline - Date.now())));
     }
-    await Promise.race([
-      Promise.allSettled(processes.map(child => child.process.exited)),
-      new Promise(resolve => setTimeout(resolve, 5_000)),
-    ]);
-    for (const child of processes) {
-      if (child.process.exitCode === null) {
-        try { child.process.kill("SIGKILL"); } catch { /* already stopped */ }
-      }
-    }
+    for (const child of processes) signalChild(child.process, "SIGKILL");
+    await Promise.allSettled(processes.map(child => child.process.exited));
     process.exit(exitCode);
   };
 
   process.on("SIGINT", () => void stop("SIGINT", 0));
   process.on("SIGTERM", () => void stop("SIGTERM", 0));
 
-  const first = await Promise.race(processes.map(async child => ({
-    label: child.label,
-    exitCode: await child.process.exited,
-  })));
-  if (!stopping) {
-    console.error(`[dev] ${first.label} exited with code ${first.exitCode}`);
-    await stop("SIGTERM", first.exitCode ?? 1);
+  try {
+    for (const command of commands) {
+      const child = Bun.spawn({
+        cmd: command.cmd,
+        cwd: command.cwd,
+        env: process.env,
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+        // Keep descendants addressable after their immediate parent exits.
+        detached: useProcessGroups,
+      });
+      processes.push({ label: command.label, process: child });
+    }
+
+    console.log(`\nRun Phantom UI: http://localhost:${process.env.RUNPHANTOM_UI_PORT ?? "5948"}\n`);
+    const first = await Promise.race(processes.map(async child => ({
+      label: child.label,
+      exitCode: await child.process.exited,
+    })));
+    if (!stopping) {
+      console.error(`[dev] ${first.label} exited with code ${first.exitCode}`);
+      await stop("SIGTERM", first.exitCode ?? 1);
+    }
+  } catch (error) {
+    console.error("[dev] startup failed", error);
+    await stop("SIGTERM", 1);
   }
 }
 
-if (import.meta.main) void main();
+if (import.meta.main) void runDev();
