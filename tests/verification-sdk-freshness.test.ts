@@ -46,7 +46,7 @@ describe("browser SDK freshness through the real Bun generator", () => {
       fs.writeFileSync(output, changed);
       const result = invoke("--check");
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr.toString()).toContain("stale");
+      expect(result.stderr?.toString()).toContain("stale");
       expect(fs.readFileSync(output, "utf8")).toBe(changed);
     });
   });
