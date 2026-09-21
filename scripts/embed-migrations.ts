@@ -122,7 +122,8 @@ function main(): void {
   const next = buildSource();
   if (check) {
     const current = existsSync(OUT_PATH) ? readFileSync(OUT_PATH, "utf8") : "";
-    if (current !== next) {
+    // Git may check out this generated TypeScript as CRLF; SQL asset bytes stay untouched.
+    if (current.replace(/\r\n/g, "\n") !== next) {
       console.error(
         `[embed-migrations] ${path.relative(REPO_ROOT, OUT_PATH)} is stale. ` +
           `Run \`bun scripts/embed-migrations.ts\` or \`bun run db:generate\`.`,
