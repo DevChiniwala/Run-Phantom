@@ -10,6 +10,9 @@
 # The script assumes bun, curl, jq, and sqlite3 are available.
 
 set -euo pipefail
+# Bash monitor mode gives each background launch its own POSIX process group
+# (including on macOS Bash 3.2). Never signal the invoking shell's group.
+set -m
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-5990}"
@@ -50,13 +53,16 @@ printf '%s\n' "$$" > "$TEST_ROOT/.upgrade-owned"
 DB="$TEST_ROOT/upgrade.db"
 DAEMON_LOG=""
 DAEMON_PID=""
+COMMAND_PID=""
 
 isolated_runtime() {
-  env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TEST_ROOT" \
+  exec env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TEST_ROOT" \
     RUNPHANTOM_PORT="$PORT" RUNPHANTOM_BIND_HOST=127.0.0.1 \
     RUNPHANTOM_DB_PATH="$DB" RUNPHANTOM_SECRET_STORE_PATH="$TEST_ROOT/secrets.json" \
     RUNPHANTOM_CLAUDE_CLI_CHAT=0 "$@"
 }
+
+isolated_version() { isolated_runtime "$@" 2>&1; }
 
 log_size() { [ -f "$DAEMON_LOG" ] && wc -c < "$DAEMON_LOG" | tr -d ' ' || echo 0; }
 log_since() {
@@ -67,13 +73,13 @@ log_since() {
 }
 
 wait_for_health() {
-  local port="$1"
+  local port="$1" health
   local timeout_s="${2:-60}"
   local deadline=$((SECONDS + timeout_s))
   while [ "$SECONDS" -lt "$deadline" ]; do
     kill -0 "$DAEMON_PID" 2>/dev/null || return 1
-    if curl --noproxy '*' --max-time 1 -fsS "http://127.0.0.1:$port/health" 2>/dev/null |
-      jq -e --argjson expected "$DAEMON_PID" '.pid == $expected' >/dev/null 2>&1; then
+    if capture_tracked health curl --noproxy '*' --max-time 1 -fsS "http://127.0.0.1:$port/health" 2>/dev/null &&
+      printf '%s' "$health" | jq -e --argjson expected "$DAEMON_PID" '.pid == $expected' >/dev/null 2>&1; then
       kill -0 "$DAEMON_PID" 2>/dev/null && return 0
     fi
     sleep 0.5
@@ -81,26 +87,68 @@ wait_for_health() {
   return 1
 }
 
-stop_owned_daemon() {
-  local pid="$DAEMON_PID"
-  DAEMON_PID=""
+# Run blocking work in a child so Bash's builtin wait can be interrupted.
+# Capture in the parent shell: command substitution would lose PID ownership.
+run_tracked() {
+  ( set +m; "$@" ) &
+  COMMAND_PID=$!
+  local status=0
+  wait "$COMMAND_PID" || status=$?
+  # The driver may exit before its descendants; keep the group until drained.
+  if stop_owned_process "$COMMAND_PID" 1; then
+    COMMAND_PID=""
+  elif [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  return "$status"
+}
+
+capture_tracked() {
+  local variable="$1"
+  shift
+  run_tracked "$@" > "$TEST_ROOT/command-output" || return $?
+  printf -v "$variable" '%s' "$(< "$TEST_ROOT/command-output")"
+}
+
+stop_owned_process() {
+  local pid="$1" grace="$2" deadline
   [ -n "$pid" ] || return 0
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    local deadline=$((SECONDS + 5))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-      kill -0 "$pid" 2>/dev/null || break
+  # Callers pass only $! from our monitor-mode launches, where PID == PGID.
+  case "$pid" in *[!0-9]*|'') return 1 ;; esac
+  [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ] || return 1
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    deadline=$((SECONDS + grace))
+    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
       sleep 0.1
     done
-    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+    # Reaping descendants can lag behind the leader. Bound that wait too.
+    deadline=$((SECONDS + 2))
+    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+      sleep 0.1
+    done
+  fi
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    echo "::error::owned process group $pid did not terminate" >&2
+    return 1
   fi
   wait "$pid" 2>/dev/null || true
+}
+
+stop_owned_daemon() {
+  stop_owned_process "$DAEMON_PID" 5 || return $?
+  # Retain ownership if a signal interrupts the normal shutdown grace period.
+  DAEMON_PID=""
 }
 
 start_owned_daemon() {
   local binary="$1"
   DAEMON_LOG="$2"
   (
+    set +m
     cd "$TEST_ROOT"
     exec env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TEST_ROOT" \
       RUNPHANTOM_PORT="$PORT" RUNPHANTOM_BIND_HOST=127.0.0.1 \
@@ -115,6 +163,7 @@ cleanup() {
   # Once cleanup owns shutdown, repeated interrupts must not abandon its child.
   trap '' INT TERM
   set +e
+  if stop_owned_process "$COMMAND_PID" 1; then COMMAND_PID=""; fi
   stop_owned_daemon
   if [ "$status" -ne 0 ] && [ -n "$DAEMON_LOG" ] && [ -f "$DAEMON_LOG" ]; then tail -100 "$DAEMON_LOG" >&2; fi
   if [ -d "$TEST_ROOT" ] && [ ! -L "$TEST_ROOT" ] && [ "$(cat "$TEST_ROOT/.upgrade-owned" 2>/dev/null)" = "$$" ]; then
@@ -127,7 +176,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "── 1/8 validate the explicit Run Phantom baseline"
-OLD_VER="$(isolated_runtime "$OLD_BIN" --version 2>&1)"
+capture_tracked OLD_VER isolated_version "$OLD_BIN" --version
 OLD_VER="${OLD_VER%%$'\n'*}"
 echo "   stable = $OLD_VER"
 
@@ -139,7 +188,7 @@ wait_for_health "$PORT" 60 || {
 }
 
 echo "── 3/8 seed fixtures via OTLP"
-isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" bun "$REPO_ROOT/scripts/seed-traces.ts"
+run_tracked isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" bun "$REPO_ROOT/scripts/seed-traces.ts"
 
 # Pinned trace ID for fixture 1 (`fixtureSuccessfulEdit`, salt=0). Used below
 # to assert per-row data survives migration, not just aggregate row count —
@@ -148,10 +197,11 @@ isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" bun "$REPO_ROOT/scr
 FIXTURE_RUN_ID="00000000000000000000000000000001"
 
 echo "── 4/8 snapshot run count + fixture outline under stable"
-OLD_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
+capture_tracked OLD_RUNS curl --noproxy '*' --connect-timeout 5 --max-time 15 -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000"
+OLD_RUNS="$(printf '%s' "$OLD_RUNS" | jq 'length')"
 echo "   $OLD_RUNS runs persisted"
 [ "$OLD_RUNS" -ge 3 ] || { echo "::error::expected ≥3 seeded runs, got $OLD_RUNS"; exit 1; }
-OLD_OUTLINE="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
+capture_tracked OLD_OUTLINE curl --noproxy '*' --connect-timeout 5 --max-time 15 -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400"
 OLD_EVENT_NAME="$(printf '%s' "$OLD_OUTLINE" | jq -r '.run.event_name // empty')"
 OLD_SPAN_COUNT="$(printf '%s' "$OLD_OUTLINE" | jq '.spans | length')"
 [ -n "$OLD_EVENT_NAME" ] || { echo "::error::stable did not return event_name for $FIXTURE_RUN_ID"; exit 1; }
@@ -173,22 +223,24 @@ stop_owned_daemon
 #  - Schema table set: catches a migration that drops a table entirely.
 # sqlite3 CLI is preinstalled on ubuntu-latest GHA runners.
 echo "   reading raw DB state via sqlite3..."
-OLD_MIGRATION_COUNT="$(sqlite3 "$DB" 'SELECT COUNT(*) FROM __drizzle_migrations')"
+capture_tracked OLD_MIGRATION_COUNT sqlite3 "$DB" 'SELECT COUNT(*) FROM __drizzle_migrations'
 [ "$OLD_MIGRATION_COUNT" -gt 0 ] || { echo "::error::__drizzle_migrations empty under stable"; exit 1; }
-OLD_INPUT_PAYLOAD="$(sqlite3 "$DB" "SELECT input_payload FROM spans WHERE run_id='$FIXTURE_RUN_ID' AND parent_span_id IS NULL")"
+capture_tracked OLD_INPUT_PAYLOAD sqlite3 "$DB" "SELECT input_payload FROM spans WHERE run_id='$FIXTURE_RUN_ID' AND parent_span_id IS NULL"
 [ -n "$OLD_INPUT_PAYLOAD" ] || { echo "::error::stable: fixture root span has empty input_payload"; exit 1; }
-OLD_TABLES="$(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" | tr '\n' ',')"
+capture_tracked OLD_TABLES sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+OLD_TABLES="$(printf '%s\n' "$OLD_TABLES" | tr '\n' ',')"
 echo "   migrations=$OLD_MIGRATION_COUNT  payload_bytes=${#OLD_INPUT_PAYLOAD}  tables=$OLD_TABLES"
 
 echo "── 5/8 prepare PR's binary"
 if [ -z "$NEW_BIN" ]; then
-  ( cd "$REPO_ROOT" && bun scripts/build-bun.ts >/dev/null )
+  build_candidate() { cd "$REPO_ROOT" && exec bun scripts/build-bun.ts; }
+  run_tracked build_candidate >/dev/null
   HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
   HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "x86_64" ] && HOST_ARCH="x64"; [ "$HOST_ARCH" = "aarch64" ] && HOST_ARCH="arm64"
   NEW_BIN="$REPO_ROOT/build/bun/runphantom-bun-${HOST_OS}-${HOST_ARCH}"
 fi
 [ -x "$NEW_BIN" ] || { echo "::error::build did not produce $NEW_BIN"; exit 1; }
-NEW_VER="$(isolated_runtime "$NEW_BIN" --version 2>&1)"
+capture_tracked NEW_VER isolated_version "$NEW_BIN" --version
 NEW_VER="${NEW_VER%%$'\n'*}"
 echo "   PR     = $NEW_VER"
 if [ "$OLD_VER" = "$NEW_VER" ]; then
@@ -203,7 +255,8 @@ wait_for_health "$PORT" 60 || {
 }
 
 echo "── 7/8 verify migration preserved data"
-NEW_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
+capture_tracked NEW_RUNS curl --noproxy '*' --connect-timeout 5 --max-time 15 -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000"
+NEW_RUNS="$(printf '%s' "$NEW_RUNS" | jq 'length')"
 echo "   $NEW_RUNS runs survive migration"
 [ "$NEW_RUNS" -ge "$OLD_RUNS" ] || {
   echo "::error::data loss after upgrade: $OLD_RUNS → $NEW_RUNS"
@@ -212,7 +265,7 @@ echo "   $NEW_RUNS runs survive migration"
 # Per-row check: fetch the same fixture run and assert its event_name +
 # span count survive. Aggregate count check alone misses migrations that
 # drop columns, truncate payloads, or rename event_name.
-NEW_OUTLINE="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400")"
+capture_tracked NEW_OUTLINE curl --noproxy '*' --connect-timeout 5 --max-time 15 -fsS "http://127.0.0.1:$PORT/api/runs/$FIXTURE_RUN_ID/outline?payload_preview_chars=400"
 NEW_EVENT_NAME="$(printf '%s' "$NEW_OUTLINE" | jq -r '.run.event_name // empty')"
 NEW_SPAN_COUNT="$(printf '%s' "$NEW_OUTLINE" | jq '.spans | length')"
 if [ "$NEW_EVENT_NAME" != "$OLD_EVENT_NAME" ]; then
@@ -230,9 +283,10 @@ echo "   fixture run intact: event_name=$NEW_EVENT_NAME spans=$NEW_SPAN_COUNT"
 # can't see (preview comes from a separate column, runs list doesn't
 # expose the migrations journal).
 echo "   reading raw DB state via sqlite3..."
-NEW_TABLES="$(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" | tr '\n' ',')"
-NEW_MIGRATION_COUNT="$(sqlite3 "$DB" 'SELECT COUNT(*) FROM __drizzle_migrations')"
-NEW_INPUT_PAYLOAD="$(sqlite3 "$DB" "SELECT input_payload FROM spans WHERE run_id='$FIXTURE_RUN_ID' AND parent_span_id IS NULL")"
+capture_tracked NEW_TABLES sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+NEW_TABLES="$(printf '%s\n' "$NEW_TABLES" | tr '\n' ',')"
+capture_tracked NEW_MIGRATION_COUNT sqlite3 "$DB" 'SELECT COUNT(*) FROM __drizzle_migrations'
+capture_tracked NEW_INPUT_PAYLOAD sqlite3 "$DB" "SELECT input_payload FROM spans WHERE run_id='$FIXTURE_RUN_ID' AND parent_span_id IS NULL"
 
 # All tables that existed under stable must still exist. New tables are
 # fine (a forward migration that adds a table is expected). A dropped
@@ -279,11 +333,12 @@ echo "── 8/8 seed fresh traces under PR binary, verify writes accepted + no 
 LOG_BEFORE_WRITE="$(log_size)"
 # Salt the trace IDs so the second seed produces distinct rows instead of
 # upserting the originals — the strict-greater check below depends on it.
-isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" RUNPHANTOM_SEED_SALT=1000 \
+run_tracked isolated_runtime env RUNPHANTOM_URL="http://127.0.0.1:$PORT" RUNPHANTOM_SEED_SALT=1000 \
   bun "$REPO_ROOT/scripts/seed-traces.ts"
 # Daemon flushes spans + partial events on a short interval; give it room.
 sleep 2
-FINAL_RUNS="$(curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000" | jq 'length')"
+capture_tracked FINAL_RUNS curl --noproxy '*' --connect-timeout 5 --max-time 15 -fsS "http://127.0.0.1:$PORT/api/runs?limit=5000"
+FINAL_RUNS="$(printf '%s' "$FINAL_RUNS" | jq 'length')"
 echo "   $FINAL_RUNS runs after fresh seed"
 [ "$FINAL_RUNS" -gt "$NEW_RUNS" ] || {
   echo "::error::PR binary did not accept new writes: $NEW_RUNS → $FINAL_RUNS"
