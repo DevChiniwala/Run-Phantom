@@ -57,14 +57,45 @@ function checkPortsOrExit(ports: { port: number; label: string }[]): void {
   process.exit(1);
 }
 
-function binOnPath(bin: string): boolean {
-  return (process.env.PATH ?? "").split(":").some((dir) => {
-    try {
-      return fs.existsSync(path.join(dir, bin));
-    } catch {
-      return false;
-    }
-  });
+export function pathEntries(value: string, platform: NodeJS.Platform): string[] {
+  return value.split(platform === "win32" ? ";" : ":");
+}
+
+export function executableCandidates(
+  bin: string,
+  platform: NodeJS.Platform,
+  pathext = process.env.PATHEXT,
+): string[] {
+  const extensions = (pathext ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .filter(Boolean);
+  if (
+    platform !== "win32" ||
+    extensions.some((extension) => bin.toLowerCase().endsWith(extension.toLowerCase()))
+  ) {
+    return [bin];
+  }
+  return [bin, ...extensions.map((extension) => `${bin}${extension}`)];
+}
+
+export function binOnPath(
+  bin: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const pathValue = env.PATH ?? env.Path ?? "";
+  const join = (...parts: string[]) =>
+    platform === "win32" ? path.win32.join(...parts) : path.posix.join(...parts);
+  const candidates = executableCandidates(bin, platform, env.PATHEXT);
+  return pathEntries(pathValue, platform).some((dir) =>
+    candidates.some((candidate) => {
+      try {
+        return fs.existsSync(join(dir, candidate));
+      } catch {
+        return false;
+      }
+    }),
+  );
 }
 
 // The daemon's SPA fallthrough sends every non-API route to
@@ -89,18 +120,35 @@ function ensureRunPhantomUi(): void {
 }
 
 // macOS ships `python3` → 3.9, too old for some SDKs (requires ≥ 3.10);
-// prefer a Homebrew `python3.12` / `python3.13` when one is on PATH.
-function pickPython3(): string | null {
-  for (const candidate of [
-    "python3.13",
-    "python3.12",
-    "python3.11",
-    "python3.10",
-    "python3",
-  ]) {
-    if (binOnPath(candidate)) return candidate;
+// prefer a Homebrew `python3.12` / `python3.13` there, while Windows commonly
+// exposes the same runtime as `python` or the `py` launcher.
+export function pickPython3(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const candidates = platform === "win32"
+    ? ["python", "python3", "py"]
+    : ["python3.13", "python3.12", "python3.11", "python3.10", "python3"];
+  for (const candidate of candidates) {
+    if (binOnPath(candidate, env, platform)) return candidate;
   }
   return null;
+}
+
+export function pythonVenvPath(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  const join = (...parts: string[]) =>
+    platform === "win32" ? path.win32.join(...parts) : path.posix.join(...parts);
+  return platform === "win32"
+    ? join(cwd, ".venv", "Scripts", "python.exe")
+    : join(cwd, ".venv", "bin", "python");
+}
+
+export function pythonPipPath(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  const join = (...parts: string[]) =>
+    platform === "win32" ? path.win32.join(...parts) : path.posix.join(...parts);
+  return platform === "win32"
+    ? join(cwd, ".venv", "Scripts", "pip.exe")
+    : join(cwd, ".venv", "bin", "pip");
 }
 
 type ExampleRuntime = "bun" | "python" | "rust" | "go";
@@ -131,8 +179,8 @@ const ENTRYPOINT_BY_RUNTIME: Record<ExampleRuntime, string> = {
 function spawnCmdFor(runtime: ExampleRuntime, cwd: string): string[] {
   switch (runtime) {
     case "python": {
-      const venvPython = path.join(cwd, ".venv", "bin", "python");
-      const py = fs.existsSync(venvPython) ? venvPython : "python3";
+      const venvPython = pythonVenvPath(cwd);
+      const py = fs.existsSync(venvPython) ? venvPython : pickPython3() ?? "python3";
       return [py, "server.py"];
     }
     case "rust":
@@ -168,7 +216,7 @@ function ensureBunDeps(app: ExampleApp, cwd: string): string | null {
 
 function ensurePythonVenv(app: ExampleApp, cwd: string): string | null {
   if (app.runtime !== "python") return null;
-  const venvPython = path.join(cwd, ".venv", "bin", "python");
+  const venvPython = pythonVenvPath(cwd);
   if (fs.existsSync(venvPython)) return null;
 
   const python = pickPython3();
@@ -184,15 +232,16 @@ function ensurePythonVenv(app: ExampleApp, cwd: string): string | null {
     stderr: "inherit",
   });
   if (venv.exitCode !== 0) {
-    return `${python} -m venv failed (exit ${venv.exitCode}) — run \`cd examples/${app.name} && ${python} -m venv .venv && .venv/bin/pip install -r requirements.txt\``;
+    const venvPython = pythonVenvPath(".");
+    return `${python} -m venv failed (exit ${venv.exitCode}) — run \`cd examples/${app.name} && ${python} -m venv .venv && ${venvPython} -m pip install -r requirements.txt\``;
   }
   if (fs.existsSync(requirements)) {
     const pip = spawnSync(
-      [path.join(cwd, ".venv", "bin", "pip"), "install", "-q", "-r", "requirements.txt"],
+      [pythonPipPath(cwd), "install", "-q", "-r", "requirements.txt"],
       { cwd, stdout: "inherit", stderr: "inherit" },
     );
     if (pip.exitCode !== 0) {
-      return `pip install failed (exit ${pip.exitCode}) — run \`cd examples/${app.name} && .venv/bin/pip install -r requirements.txt\` (verify your venv interpreter and SDK compatibility)`;
+      return `pip install failed (exit ${pip.exitCode}) — run \`cd examples/${app.name} && ${pythonPipPath(".")} install -r requirements.txt\` (verify your venv interpreter and SDK compatibility)`;
     }
   }
   return null;
@@ -431,7 +480,9 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
