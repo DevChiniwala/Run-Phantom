@@ -248,6 +248,16 @@ test("Run Phantom UI: trajectory renders when the first spans arrive after live 
 test("Run Phantom UI: a trajectory tooltip never covers the bar it describes", async ({ page, runPhantom }) => {
   const replay = await fetch(`${runPhantom.url}/api/demo-traces/replay`, { method: "POST" });
   expect(replay.ok).toBe(true);
+  // All seven bars exist before the final LLM duration arrives. Placement is a
+  // completed-snapshot contract; wait before navigation so live updates cannot
+  // move the hovered bar out from under the pointer during measurement.
+  await expect.poll(async () => {
+    const response = await fetch(`${runPhantom.url}/api/runs/detail/demo_review`);
+    if (response.status === 404) return 0;
+    expect(response.ok).toBe(true);
+    const detail = await response.json() as { run: { finished?: number | null } };
+    return detail.run.finished;
+  }, { timeout: 20_000 }).toBe(1);
 
   // The tooltip is up to 480px tall. When it fit neither below nor above the bar
   // it was clamped to the top of the viewport, over the bar, so the bar could no
@@ -257,9 +267,8 @@ test("Run Phantom UI: a trajectory tooltip never covers the bar it describes", a
     await page.goto(`${runPhantom.url}/runs/demo_review`);
     await expect(page.locator("[data-run-status]")).toHaveText(/^Run (?:live|failed)$/, { timeout: 20_000 });
 
-    // The review demo streams seven trajectory spans; wait for all of them so a
-    // bar cannot mount mid-loop and shift the layout under the hover.
-    // Narrow error spans render as a triangle button instead of a labelled bar.
+    // Retain the exact bar-count check on the completed snapshot. Narrow error
+    // spans render as a triangle button instead of a labelled bar.
     const bars = page.locator('button.timeline-bar, button[aria-label^="Jump to "]');
     await expect.poll(async () => bars.count(), { timeout: 20_000 }).toBe(7);
     const count = await bars.count();
