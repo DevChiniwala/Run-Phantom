@@ -61,7 +61,7 @@ describe("team runtime authority boundary", () => {
       const file = pending.pop()!;
       if (visited.has(file)) continue;
       visited.add(file);
-      const relative = path.relative(root, file);
+      const relative = path.relative(root, file).split(path.sep).join("/");
       if (forbidden.test(relative)) violations.push(relative);
       for (const source of runtimeImports(file)) {
         if (/^(?:node:)?child_process$/.test(source) && relative !== "src/ui-assets.ts") {

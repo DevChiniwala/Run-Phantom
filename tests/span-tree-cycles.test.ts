@@ -5,7 +5,8 @@ import path from "path";
 
 // realpath because macOS reports a symlinked tmpdir; a bare "/private/tmp" literal
 // is a macOS-ism that cannot be created on Linux CI.
-const DB = path.join(fs.realpathSync(os.tmpdir()), "rp-e2e", "cycle-test.db");
+let directory: string;
+let DB: string;
 
 const { upsertRun, insertSpan, getRunOutline, closeDb } = await import("../src/db");
 
@@ -23,7 +24,10 @@ function withFixtureDb(fn: () => void): void {
   }
 }
 
-afterAll(() => { closeDb(); });
+afterAll(() => {
+  closeDb();
+  if (directory) fs.rmSync(directory, { recursive: true, force: true });
+});
 
 function seed(runId: string, spans: { id: string; parent?: string; name: string }[]) {
   const now = Date.now();
@@ -37,10 +41,11 @@ describe("outline depth on malformed parent chains", () => {
   // Nothing in OTLP forbids a span naming a descendant as its parent, and the
   // recursive depth walk overflowed the stack on one, taking the run's outline
   // to a 500 for good.
-  beforeAll(() => withFixtureDb(() => {
-    for (const suffix of ["", "-wal", "-shm"]) {
-      try { fs.unlinkSync(DB + suffix); } catch { /* fresh run */ }
-    }
+  beforeAll(() => {
+    directory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "rp-cycles-"));
+    DB = path.join(directory, "cycle-test.db");
+    closeDb();
+    withFixtureDb(() => {
     seed("cycle2", [{ id: "a", parent: "b", name: "A" }, { id: "b", parent: "a", name: "B" }]);
     seed("selfref", [{ id: "s", parent: "s", name: "S" }]);
     seed("cycle3", [
@@ -53,7 +58,8 @@ describe("outline depth on malformed parent chains", () => {
     ]);
     // Force the lazy connection open while the fixture path is still in effect.
     getRunOutline("normal");
-  }));
+    });
+  });
 
   test("a two-span cycle returns finite depths instead of overflowing", () => {
     const spans = getRunOutline("cycle2").spans;

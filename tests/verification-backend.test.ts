@@ -399,9 +399,19 @@ describe("application verification daemon", () => {
   });
 
   test("report retention is bounded and reset clears reports and saved flows", () => {
-    for (let i = 0; i <= L.MAX_REPORTS; i++) saveReport({ id: `bounded-report-${i}`, sessionId: "test-session", runId: null, flowId: null, name: "Bounded", status: "inconclusive", reason: "test", evidence: [], createdAt: Date.now() + i });
-    const row = getDrizzleDb().$client.query("SELECT COUNT(*) AS n FROM verification_reports").get() as { n: number };
+    const db = getDrizzleDb().$client;
+    const firstCreatedAt = Date.now();
+    const report = (i: number) => ({ id: `bounded-report-${i}`, sessionId: "test-session", runId: null, flowId: null, name: "Bounded", status: "inconclusive" as const, reason: "test", evidence: [], createdAt: firstCreatedAt + i });
+    // Batch fixture setup, not the boundary write: a thousand independent fsyncs
+    // measures the runner's disk rather than the retention contract.
+    db.transaction(() => {
+      for (let i = 0; i < L.MAX_REPORTS; i++) saveReport(report(i));
+    })();
+    saveReport(report(L.MAX_REPORTS));
+    const row = db.query("SELECT COUNT(*) AS n FROM verification_reports").get() as { n: number };
     expect(row.n).toBe(L.MAX_REPORTS);
+    expect(db.query("SELECT id FROM verification_reports WHERE id = ?").get("bounded-report-0")).toBeNull();
+    expect(db.query("SELECT id FROM verification_reports WHERE id = ?").get(`bounded-report-${L.MAX_REPORTS}`)).not.toBeNull();
     clearAll();
     expect(listReports()).toEqual([]);
     expect(listFlows()).toEqual([]);
