@@ -24,6 +24,8 @@ test("evaluation migration upgrades schema 0005 without changing traces or verif
   const priorEntries = journal.entries.filter((entry) => entry.idx <= 5);
   const previousDb = process.env.RUNPHANTOM_DB_PATH;
   let baseline: Database | null = null;
+  let upgraded: Database | null = null;
+  let reopened: Database | null = null;
   let service: ReturnType<typeof createEvaluationService> | undefined;
   closeDb();
 
@@ -63,11 +65,11 @@ test("evaluation migration upgrades schema 0005 without changing traces or verif
       history: baseline.query("SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at").all(),
     };
     expect(original.history).toHaveLength(6);
-    baseline.close();
+    baseline.close(true);
     baseline = null;
 
     process.env.RUNPHANTOM_DB_PATH = dbPath;
-    const upgraded = getDrizzleDb().$client;
+    upgraded = getDrizzleDb().$client;
     expect(upgraded.query("SELECT * FROM runs ORDER BY id").all()).toEqual(original.runs);
     expect(upgraded.query("SELECT * FROM spans ORDER BY run_id, id").all()).toEqual(original.spans);
     expect(upgraded.query("SELECT * FROM verification_flows ORDER BY id").all()).toEqual(original.flows);
@@ -95,8 +97,10 @@ test("evaluation migration upgrades schema 0005 without changing traces or verif
 
     service.close();
     service = undefined;
+    upgraded.close(true);
+    upgraded = null;
     closeDb();
-    const reopened = getDrizzleDb().$client;
+    reopened = getDrizzleDb().$client;
     expect(getRevision(initial.datasetId, 1)).toEqual(initial);
     expect(getRevision(revision.datasetId)).toEqual(revision);
     expect(getExperiment(experiment.id)).toEqual(experiment);
@@ -108,11 +112,18 @@ test("evaluation migration upgrades schema 0005 without changing traces or verif
     expect(reopened.query("SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at").all()).toEqual(upgradedHistory);
     expect(reopened.query("PRAGMA foreign_key_check").all()).toEqual([]);
   } finally {
-    service?.close();
-    baseline?.close();
-    closeDb();
-    if (previousDb === undefined) delete process.env.RUNPHANTOM_DB_PATH;
-    else process.env.RUNPHANTOM_DB_PATH = previousDb;
+    try {
+      service?.close();
+      // The baseline is not globally owned; close every acquired client strictly
+      // before resetting global state. Release aliases before closeDb collects.
+      baseline?.close(true); baseline = null;
+      upgraded?.close(true); upgraded = null;
+      reopened?.close(true); reopened = null;
+      closeDb();
+    } finally {
+      if (previousDb === undefined) delete process.env.RUNPHANTOM_DB_PATH;
+      else process.env.RUNPHANTOM_DB_PATH = previousDb;
+    }
     rmSync(directory, { recursive: true, force: true });
   }
 });
