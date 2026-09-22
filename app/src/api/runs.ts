@@ -51,8 +51,8 @@ export async function getRunDetailOrNull(runId: string): Promise<RunDetailData |
   return apiJsonOrNull<RunDetailData>(`/api/runs/detail/${encodeURIComponent(runId)}`);
 }
 
-export async function listConversationRuns(convoId: string): Promise<Run[]> {
-  return apiJson<Run[]>(`/api/convo/${encodeURIComponent(convoId)}`);
+export async function listConversationRuns(convoId: string, signal?: AbortSignal): Promise<Run[]> {
+  return apiJson<Run[]>(`/api/convo/${encodeURIComponent(convoId)}`, { signal });
 }
 
 export async function deleteRun(runId: string): Promise<void> {

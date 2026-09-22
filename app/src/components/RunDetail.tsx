@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { flushSync } from "react-dom";
+import { isRunDeleting, setRunDeleting, subscribeRunDeletions } from "../hooks/use-runs";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   runPath,
@@ -24,7 +26,7 @@ import { C } from "../utils/colors";
 import { fmt, isActive, plural, runDisplayName, isoTimestamp, safeDecodeParam } from "../utils/helpers";
 import { useQueryClient } from "@tanstack/react-query";
 import { parseReplayMetadata } from "../utils/types";
-import { renameRun } from "../api/runs";
+import { deleteRun, renameRun } from "../api/runs";
 import type { Run, Span, LiveEvent, SubAgent } from "../utils/types";
 import {
   getSavedEvents,
@@ -349,13 +351,22 @@ function StatsLine({ stats, model, spans, active, startedAt }: {
   );
 }
 
-function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; deleteRedirectPath?: string }) {
-  const navigate = useNavigate();
+function MoreMenu({ runId }: { runId?: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const deleteRef = useRef<HTMLButtonElement>(null);
   const menuId = useId();
+  const queryClient = useQueryClient();
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ runId: string; message: string } | null>(null);
+  const currentRunId = useRef(runId);
+  currentRunId.current = runId;
+  const deleting = deletingRunId === runId;
+  useEffect(() => {
+    currentRunId.current = runId;
+    return () => { currentRunId.current = undefined; };
+  }, [runId]);
 
   useEffect(() => {
     if (!open) return;
@@ -378,16 +389,50 @@ function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; del
   }, [open]);
 
   const handleDelete = async () => {
-    if (!runId || !confirm("Delete this run and all its spans?")) return;
-    setOpen(false);
-    window.dispatchEvent(new CustomEvent("runphantom:run-removed", { detail: { runId } }));
-    navigate(deleteRedirectPath, { replace: true });
-    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-    await fetch(`/api/runs/${runId}`, { method: "DELETE" });
+    if (!runId || isRunDeleting(runId) || !confirm("Delete this run and all its spans?")) return;
+    setDeletingRunId(runId);
+    setDeleteError(null);
+    setRunDeleting(runId, true);
+    let deleted = false;
+    try {
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["run-detail", runId], exact: true }),
+        queryClient.cancelQueries({ queryKey: ["conversation-runs"] }),
+      ]);
+      await deleteRun(runId);
+      deleted = true;
+      // A conversation list response may still contain the removed run. Cancel
+      // it before pruning, and never invalidate the deleted detail itself.
+      await queryClient.cancelQueries({ queryKey: ["conversation-runs"] });
+      queryClient.setQueriesData<Run[]>({ queryKey: ["conversation-runs"] },
+        runs => runs?.filter(run => run.id !== runId));
+      queryClient.setQueriesData<Run[]>({ queryKey: ["runs"], exact: true },
+        runs => runs?.filter(run => run.id !== runId));
+      flushSync(() => {
+        window.dispatchEvent(new CustomEvent("runphantom:run-removed", { detail: { runId } }));
+      });
+      queryClient.removeQueries({ queryKey: ["run-detail", runId], exact: true });
+    } catch (error) {
+      if (currentRunId.current === runId) {
+        setDeleteError({ runId, message: error instanceof Error ? error.message : "Could not delete run" });
+      }
+    } finally {
+      setRunDeleting(runId, false);
+      setDeletingRunId(current => current === runId ? null : current);
+      if (!deleted) {
+        // Dynamic enabled guards prevent races, but cannot themselves restart a
+        // canceled observer. Restore active reads only after a failed DELETE.
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["run-detail", runId], exact: true }),
+          queryClient.invalidateQueries({ queryKey: ["conversation-runs"] }),
+        ]);
+      }
+    }
   };
 
   return (
     <div ref={ref} className="relative">
+      {deleteError && deleteError.runId === runId && <p role="alert" className="text-xs" style={{ color: C.red }}>{deleteError.message}</p>}
       <button
         ref={triggerRef}
         type="button"
@@ -412,8 +457,9 @@ function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; del
             className="w-full text-left px-3 py-2 text-[11px] transition-colors hover:bg-[color:var(--rp-ink-wash)]"
             style={{ color: C.red }}
             onClick={handleDelete}
+            disabled={deleting}
           >
-            Delete run
+            {deleting ? "Deleting…" : "Delete run"}
           </button>
         </div>
       )}
@@ -524,7 +570,7 @@ function ReplayRegistryNotice({ status, onRetry }: {
 
 function ViewHeader({
   title, model, active, stats, allSpans, startedAt, anthropicModels,
-  run, isReplay, breadcrumb, fork, onAnnotateRun, annotationError, onDownload, deleteRedirectPath,
+  run, isReplay, breadcrumb, fork, onAnnotateRun, annotationError, onDownload,
 }: {
   title: string;
   model?: string | null;
@@ -543,7 +589,6 @@ function ViewHeader({
   onAnnotateRun?: (input: { kind: AnnotationKind; note: string }) => Promise<Annotation | null>;
   annotationError?: string | null;
   onDownload?: () => void;
-  deleteRedirectPath?: string;
 }) {
   const onBack = breadcrumb?.onBack;
   const parentName = breadcrumb?.parentName;
@@ -688,7 +733,7 @@ function ViewHeader({
             <span style={{ color: C.fg0, opacity: 0.4 }}>|</span>
             <StatsLine stats={stats} model={model} spans={allSpans} active={active} startedAt={startedAt} />
           </div>
-          <MoreMenu runId={run?.id} deleteRedirectPath={deleteRedirectPath} />
+          <MoreMenu runId={run?.id} />
         </div>
       ) : (
         <>
@@ -942,7 +987,7 @@ function ViewHeader({
                   )}
                 </>;
                 })()}
-                <MoreMenu runId={run?.id} deleteRedirectPath={deleteRedirectPath} />
+                <MoreMenu runId={run?.id} />
               </div>
             )}
           </div>
@@ -1302,13 +1347,17 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   // new one: the URL showed trace B while the pane rendered trace A. Every write
   // below is gated on the request still being the current one.
   const detailRequestRef = useRef(0);
+  const detailAbortRef = useRef<AbortController | null>(null);
 
   const fetchData = useCallback(async () => {
-    if (initialData) return; // Skip DB fetch when data is provided directly
+    if (initialData || isRunDeleting(runId)) return; // Keep the visible trace during deletion.
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
     const requestId = ++detailRequestRef.current;
-    const isCurrent = () => detailRequestRef.current === requestId;
+    const isCurrent = () => detailRequestRef.current === requestId && !controller.signal.aborted;
     try {
-      const res = await fetch(`/api/runs/detail/${runId}`);
+      const res = await fetch(`/api/runs/detail/${runId}`, { signal: controller.signal });
       if (!isCurrent()) return;
       if (res.status === 404) {
         setData(null);
@@ -1328,6 +1377,35 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
     }
     finally { if (isCurrent()) setLoading(false); }
   }, [runId, initialData]);
+
+  useEffect(() => {
+    // The selected view owns navigation: the menu that started deletion may
+    // have unmounted while the user visited another trace and returned here.
+    const onRemoved = (event: Event) => {
+      if ((event as CustomEvent<{ runId: string }>).detail.runId !== runId) return;
+      navigate(routeBase ?? "/runs", { replace: true, flushSync: true });
+    };
+    window.addEventListener("runphantom:run-removed", onRemoved);
+    return () => window.removeEventListener("runphantom:run-removed", onRemoved);
+  }, [navigate, routeBase, runId]);
+
+  useEffect(() => {
+    let wasDeleting = isRunDeleting(runId);
+    const unsubscribe = subscribeRunDeletions(() => {
+      const deleting = isRunDeleting(runId);
+      if (deleting) {
+        ++detailRequestRef.current;
+        detailAbortRef.current?.abort();
+      } else if (wasDeleting) {
+        void fetchData(); // A failed delete leaves the trace selected and live.
+      }
+      wasDeleting = deleting;
+    });
+    return () => {
+      unsubscribe();
+      detailAbortRef.current?.abort();
+    };
+  }, [runId, fetchData]);
 
   useEffect(() => {
     if (initialData) return;
@@ -1560,7 +1638,6 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
         allSpans={spans}
         run={run}
         isReplay={isReplay}
-        deleteRedirectPath={routeBase ?? "/runs"}
         onAnnotateRun={(input) => createAnnotationAndSave({ ...input, source: "user" })}
         annotationError={annotationsApi.error}
         onDownload={downloadTrace}
