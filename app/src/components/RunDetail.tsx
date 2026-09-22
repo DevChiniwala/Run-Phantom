@@ -419,14 +419,11 @@ function MoreMenu({ runId }: { runId?: string }) {
     } finally {
       setRunDeleting(runId, false);
       setDeletingRunId(current => current === runId ? null : current);
-      if (!deleted) {
-        // Dynamic enabled guards prevent races, but cannot themselves restart a
-        // canceled observer. Restore active reads only after a failed DELETE.
-        await Promise.all([
-          queryClient.invalidateQueries({ queryKey: ["run-detail", runId], exact: true }),
-          queryClient.invalidateQueries({ queryKey: ["conversation-runs"] }),
-        ]);
-      }
+      // A canceled conversation may now belong to another selected run. Restart
+      // active lists for either outcome, but never refetch a deleted detail.
+      const resumed = [queryClient.invalidateQueries({ queryKey: ["conversation-runs"] })];
+      if (!deleted) resumed.push(queryClient.invalidateQueries({ queryKey: ["run-detail", runId], exact: true }));
+      await Promise.all(resumed);
     }
   };
 

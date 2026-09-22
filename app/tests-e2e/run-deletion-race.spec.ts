@@ -231,3 +231,43 @@ test("failed deletion resumes an initially pending conversation query", async ({
     await expect(page).toHaveURL(new RegExp(`${FIXTURE_PRIMARY_RUN_ID}/convo$`));
   } finally { firstRelease.release(); }
 });
+
+test("successful deletion resumes a newly selected pending conversation", async ({ page, runPhantom }) => {
+  await clearRunPhantom(runPhantom.url);
+  await seedRunPhantomFixtures(runPhantom.url);
+  const deleteHeld = gate();
+  const deleteRelease = gate();
+  const conversationHeld = gate();
+  const conversationRelease = gate();
+  let conversationRequests = 0;
+  await page.route(`**/api/runs/${FIXTURE_PRIMARY_RUN_ID}`, async route => {
+    deleteHeld.release();
+    await deleteRelease.promise;
+    await route.continue();
+  });
+  await page.route("**/api/convo/*", async route => {
+    conversationRequests++;
+    if (conversationRequests !== 1) return route.continue();
+    const response = await route.fetch();
+    conversationHeld.release();
+    await conversationRelease.promise;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("menuitem", { name: "Delete run" }).click();
+    await deleteHeld.promise;
+    await page.locator(`[data-run-id="${FIXTURE_SAVED_SIBLING_RUN_ID}"]`).click();
+    await page.getByRole("tab", { name: "Conversation" }).click();
+    await conversationHeld.promise;
+    const deleted = page.waitForResponse(response => response.request().method() === "DELETE");
+    deleteRelease.release();
+    expect((await deleted).status()).toBe(200);
+    await expect.poll(() => conversationRequests).toBeGreaterThan(1);
+    await expect(page.getByLabel("Conversation", { exact: true }).getByText("conversation", { exact: true })).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`${FIXTURE_SAVED_SIBLING_RUN_ID}/convo$`));
+    await expect(page.locator(`[data-run-id="${FIXTURE_PRIMARY_RUN_ID}"]`)).toHaveCount(0);
+  } finally { deleteRelease.release(); conversationRelease.release(); }
+});
