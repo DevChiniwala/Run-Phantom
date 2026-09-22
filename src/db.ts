@@ -159,21 +159,10 @@ export interface QueryTracesResult {
 }
 
 const BLOCKED_QUERY_RE = /\b(attach|detach|insert|update|delete|replace|drop|alter|create|pragma|vacuum|reindex|analyze)\b/i;
-const OUTPUT_AMPLIFYING_SQL_FUNCTIONS = [
-  "randomblob",
-  "zeroblob",
-  "printf",
-  "format",
-  "hex",
-  "quote",
-  "group_concat",
-  "json_group_array",
-  "json_group_object",
-].join("|");
-const BLOCKED_EXPENSIVE_QUERY_RE = new RegExp(
-  `(?:\\b(${OUTPUT_AMPLIFYING_SQL_FUNCTIONS})\\b|["'\`](${OUTPUT_AMPLIFYING_SQL_FUNCTIONS})["'\`]|\\[(${OUTPUT_AMPLIFYING_SQL_FUNCTIONS})\\])\\s*\\(`,
-  "i",
-);
+const OUTPUT_AMPLIFYING_SQL_FUNCTIONS = new Set([
+  "randomblob", "zeroblob", "printf", "format", "hex", "quote",
+  "group_concat", "json_group_array", "json_group_object",
+]);
 
 const TRACE_SAFE_TABLES = new Set([
   "annotations",
@@ -193,32 +182,30 @@ function tokenizeSql(sql: string): SqlToken[] {
   const tokens: SqlToken[] = [];
   for (let index = 0; index < sql.length;) {
     const char = sql[index];
-    if (/\s/.test(char)) {
+    if (/[ \t\n\r\f]/.test(char)) {
       index++;
       continue;
     }
-    if (char === "'") {
-      index++;
-      while (index < sql.length) {
-        if (sql[index] === "'" && sql[index + 1] === "'") {
-          index += 2;
-        } else if (sql[index++] === "'") {
-          break;
-        }
-      }
-      tokens.push({ kind: "string", value: "" });
-      continue;
-    }
-    if (char === '"' || char === "`" || char === "[") {
+    if (char === "'" || char === '"' || char === "`" || char === "[") {
       const close = char === "[" ? "]" : char;
       let value = "";
       index++;
-      while (index < sql.length && sql[index] !== close) value += sql[index++];
-      if (sql[index] === close) index++;
-      tokens.push({ kind: "identifier", value: value.toLowerCase(), quoted: true });
+      while (index < sql.length) {
+        if (sql[index] === close) {
+          if (close !== "]" && sql[index + 1] === close) {
+            value += close;
+            index += 2;
+            continue;
+          }
+          index++;
+          break;
+        }
+        value += sql[index++];
+      }
+      tokens.push({ kind: char === "'" ? "string" : "identifier", value: value.toLowerCase(), quoted: true });
       continue;
     }
-    const identifier = sql.slice(index).match(/^[a-z_][a-z0-9_$]*/i)?.[0];
+    const identifier = sql.slice(index).match(/^[a-z_\u0080-\u{10ffff}][a-z0-9_$\u0080-\u{10ffff}]*/iu)?.[0];
     if (identifier) {
       tokens.push({ kind: "identifier", value: identifier.toLowerCase() });
       index += identifier.length;
@@ -230,16 +217,22 @@ function tokenizeSql(sql: string): SqlToken[] {
   return tokens;
 }
 
-function assertTraceSafeTables(sql: string): void {
-  const tokens = tokenizeSql(sql);
+function assertTraceSafeTables(tokens: readonly SqlToken[]): void {
   const fromClauses = new Set<number>();
   let depth = 0;
-  const clauseEnd = new Set(["except", "group", "having", "intersect", "limit", "order", "union", "where", "window"]);
+  const clauseEnd = new Set(["except", "group", "having", "intersect", "limit", "order", "union", "where"]);
 
   const validateSource = (index: number): void => {
-    const source = tokens[index];
-    if (source?.kind === "punctuation" && source.value === "(") return;
-    if (!source || source.kind !== "identifier") {
+    let source = tokens[index];
+    let sourceDepth = depth;
+    while (source?.kind === "punctuation" && source.value === "(") {
+      source = tokens[++index];
+      // Subqueries expose their own FROM clauses. Parenthesized table/join
+      // groups do not, so validate their first source and subsequent commas.
+      if (source?.kind === "identifier" && !source.quoted && (source.value === "select" || source.value === "values")) return;
+      fromClauses.add(++sourceDepth);
+    }
+    if (!source || (source.kind !== "identifier" && source.kind !== "string")) {
       throw new Error("query_traces may read only trace-safe tables");
     }
     if (!TRACE_SAFE_TABLES.has(source.value)) {
@@ -262,7 +255,11 @@ function assertTraceSafeTables(sql: string): void {
       depth = Math.max(0, depth - 1);
       continue;
     }
-    if (token.kind === "identifier" && !token.quoted && clauseEnd.has(token.value)) {
+    const windowClause = token.value === "window"
+      && (tokens[index + 1]?.kind === "identifier" || tokens[index + 1]?.kind === "string")
+      && tokens[index + 2]?.value === "as" && !tokens[index + 2]?.quoted
+      && tokens[index + 3]?.value === "(";
+    if (token.kind === "identifier" && !token.quoted && (clauseEnd.has(token.value) || windowClause)) {
       fromClauses.delete(depth);
       continue;
     }
@@ -275,6 +272,12 @@ function assertTraceSafeTables(sql: string): void {
       validateSource(index + 1);
       continue;
     }
+    // SQLite's bare IN table shorthand reads a table without a FROM clause.
+    if (token.kind === "identifier" && !token.quoted && token.value === "in"
+      && !(tokens[index + 1]?.kind === "punctuation" && tokens[index + 1]?.value === "(")) {
+      validateSource(index + 1);
+      continue;
+    }
     if (token.kind === "punctuation" && token.value === "," && fromClauses.has(depth)) {
       validateSource(index + 1);
     }
@@ -282,9 +285,31 @@ function assertTraceSafeTables(sql: string): void {
 }
 
 function stripSqlComments(sql: string): string {
-  return sql
-    .replace(/--[^\n\r]*/g, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+  let out = "";
+  for (let index = 0; index < sql.length;) {
+    const char = sql[index];
+    if (char === "'" || char === '"' || char === "`" || char === "[") {
+      const start = index++;
+      const close = char === "[" ? "]" : char;
+      while (index < sql.length) {
+        if (sql[index++] !== close) continue;
+        if (close !== "]" && sql[index] === close) { index++; continue; }
+        break;
+      }
+      out += sql.slice(start, index);
+    } else if (char === "-" && sql[index + 1] === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index++;
+      out += " ";
+    } else if (char === "/" && sql[index + 1] === "*") {
+      const end = sql.indexOf("*/", index + 2);
+      index = end === -1 ? sql.length : end + 2;
+      out += " ";
+    } else {
+      out += sql[index++];
+    }
+  }
+  return out;
 }
 
 /**
@@ -328,8 +353,8 @@ function assertReadOnlyTraceQuery(sql: string): string {
   if (!trimmed) throw new Error("sql required");
 
   const withoutTrailingSemicolon = trimmed.replace(/;\s*$/, "").trim();
-  // Every structural check runs on the masked form so a keyword or separator
-  // that only appears inside a quoted literal cannot trip it.
+  // Mask literals for keyword/separator checks; token-based name checks below
+  // retain quoted function and table identifiers.
   const code = maskSqlLiterals(withoutTrailingSemicolon);
   if (code.includes(";")) {
     throw new Error("only one SQL statement is allowed");
@@ -345,10 +370,12 @@ function assertReadOnlyTraceQuery(sql: string): string {
   if (BLOCKED_QUERY_RE.test(code)) {
     throw new Error("query contains a blocked SQL keyword");
   }
-  if (BLOCKED_EXPENSIVE_QUERY_RE.test(code)) {
+  const tokens = tokenizeSql(withoutTrailingSemicolon);
+  if (tokens.some((token, index) => OUTPUT_AMPLIFYING_SQL_FUNCTIONS.has(token.value)
+    && tokens[index + 1]?.kind === "punctuation" && tokens[index + 1]?.value === "(")) {
     throw new Error("query_traces does not allow SQL functions that can amplify output size");
   }
-  assertTraceSafeTables(withoutTrailingSemicolon);
+  assertTraceSafeTables(tokens);
   return withoutTrailingSemicolon;
 }
 
