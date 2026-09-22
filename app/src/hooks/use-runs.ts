@@ -11,7 +11,18 @@ import {
 // Synchronous guards also cover WebSocket callbacks before React commits the
 // disabled observers. Entries live only for the delete transaction, not forever.
 let deletingRuns: ReadonlySet<string> = new Set();
+// Failures outlive the menu that started deletion, including navigation away
+// and back while the request is pending. A retry clears only that run's error.
+const deletionErrors = new Map<string, string>();
 const deletionListeners = new Set<() => void>();
+export function setRunDeletionError(runId: string, message: string | null) {
+  if (message === null) deletionErrors.delete(runId);
+  else deletionErrors.set(runId, message);
+  for (const listener of deletionListeners) listener();
+}
+export function useRunDeletionError(runId: string | undefined) {
+  return useSyncExternalStore(subscribeRunDeletions, () => runId ? deletionErrors.get(runId) : undefined);
+}
 export function isRunDeleting(runId: string) { return deletingRuns.has(runId); }
 export function subscribeRunDeletions(listener: () => void) {
   deletionListeners.add(listener);
@@ -24,7 +35,7 @@ export function setRunDeleting(runId: string, deleting: boolean) {
   deletingRuns = next;
   for (const listener of deletionListeners) listener();
 }
-function useRunDeletions() {
+export function useRunDeletions() {
   return useSyncExternalStore(subscribeRunDeletions, () => deletingRuns);
 }
 

@@ -139,10 +139,11 @@ export function RunsPage() {
       if (!runId) return;
       ++runsRevision.current;
       setRuns((prev) => prev.filter((run) => run.id !== runId));
+      void fetchRuns();
     };
     window.addEventListener("runphantom:run-removed", handleRunRemoved);
     return () => window.removeEventListener("runphantom:run-removed", handleRunRemoved);
-  }, []);
+  }, [fetchRuns]);
 
   const hasUserTraces = useMemo(
     () => runs.some((run) => !isDefaultDemoRun(run)),
