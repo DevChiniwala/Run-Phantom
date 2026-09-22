@@ -72,11 +72,15 @@ export function RunsPage() {
   useEffect(() => {
     if (modelPricingConsentEnabled()) void fetchPrices();
   }, []);
+  const runsRevision = useRef(0);
   const fetchRuns = useCallback(async () => {
+    const revision = runsRevision.current;
     try {
       const res = await fetch("/api/runs");
       if (!res.ok) throw new Error(`Run list request failed (${res.status})`);
       const fresh: unknown = await res.json();
+      // A pre-delete list must not restore the removed row or auto-select it.
+      if (revision !== runsRevision.current) return;
       // A 5xx still returns valid JSON — an error object, not an array. The
       // updater below runs outside this try, so `fresh.map` threw there and took
       // the whole route down through the error boundary instead of showing a
@@ -97,6 +101,7 @@ export function RunsPage() {
         return prev.map(r => freshById.get(r.id)!);
       });
     } catch (err) {
+      if (revision !== runsRevision.current) return;
       setRunsError((err as Error).message || "Could not load runs");
     } finally {
       setRunsLoaded(true);
@@ -132,6 +137,7 @@ export function RunsPage() {
     const handleRunRemoved = (event: Event) => {
       const runId = (event as CustomEvent<{ runId?: string }>).detail?.runId;
       if (!runId) return;
+      ++runsRevision.current;
       setRuns((prev) => prev.filter((run) => run.id !== runId));
     };
     window.addEventListener("runphantom:run-removed", handleRunRemoved);

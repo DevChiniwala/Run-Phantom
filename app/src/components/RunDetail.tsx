@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { flushSync } from "react-dom";
+import { isRunDeleting, setRunDeleting, subscribeRunDeletions } from "../hooks/use-runs";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   runPath,
@@ -24,7 +26,7 @@ import { C } from "../utils/colors";
 import { fmt, isActive, plural, runDisplayName, isoTimestamp, safeDecodeParam } from "../utils/helpers";
 import { useQueryClient } from "@tanstack/react-query";
 import { parseReplayMetadata } from "../utils/types";
-import { renameRun } from "../api/runs";
+import { deleteRun, renameRun } from "../api/runs";
 import type { Run, Span, LiveEvent, SubAgent } from "../utils/types";
 import {
   getSavedEvents,
@@ -349,13 +351,22 @@ function StatsLine({ stats, model, spans, active, startedAt }: {
   );
 }
 
-function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; deleteRedirectPath?: string }) {
-  const navigate = useNavigate();
+function MoreMenu({ runId }: { runId?: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const deleteRef = useRef<HTMLButtonElement>(null);
   const menuId = useId();
+  const queryClient = useQueryClient();
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ runId: string; message: string } | null>(null);
+  const currentRunId = useRef(runId);
+  currentRunId.current = runId;
+  const deleting = deletingRunId === runId;
+  useEffect(() => {
+    currentRunId.current = runId;
+    return () => { currentRunId.current = undefined; };
+  }, [runId]);
 
   useEffect(() => {
     if (!open) return;
@@ -378,16 +389,47 @@ function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; del
   }, [open]);
 
   const handleDelete = async () => {
-    if (!runId || !confirm("Delete this run and all its spans?")) return;
-    setOpen(false);
-    window.dispatchEvent(new CustomEvent("runphantom:run-removed", { detail: { runId } }));
-    navigate(deleteRedirectPath, { replace: true });
-    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-    await fetch(`/api/runs/${runId}`, { method: "DELETE" });
+    if (!runId || isRunDeleting(runId) || !confirm("Delete this run and all its spans?")) return;
+    setDeletingRunId(runId);
+    setDeleteError(null);
+    setRunDeleting(runId, true);
+    let deleted = false;
+    try {
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["run-detail", runId], exact: true }),
+        queryClient.cancelQueries({ queryKey: ["conversation-runs"] }),
+      ]);
+      await deleteRun(runId);
+      deleted = true;
+      // A conversation list response may still contain the removed run. Cancel
+      // it before pruning, and never invalidate the deleted detail itself.
+      await queryClient.cancelQueries({ queryKey: ["conversation-runs"] });
+      queryClient.setQueriesData<Run[]>({ queryKey: ["conversation-runs"] },
+        runs => runs?.filter(run => run.id !== runId));
+      queryClient.setQueriesData<Run[]>({ queryKey: ["runs"], exact: true },
+        runs => runs?.filter(run => run.id !== runId));
+      flushSync(() => {
+        window.dispatchEvent(new CustomEvent("runphantom:run-removed", { detail: { runId } }));
+      });
+      queryClient.removeQueries({ queryKey: ["run-detail", runId], exact: true });
+    } catch (error) {
+      if (currentRunId.current === runId) {
+        setDeleteError({ runId, message: error instanceof Error ? error.message : "Could not delete run" });
+      }
+    } finally {
+      setRunDeleting(runId, false);
+      setDeletingRunId(current => current === runId ? null : current);
+      // A canceled conversation may now belong to another selected run. Restart
+      // active lists for either outcome, but never refetch a deleted detail.
+      const resumed = [queryClient.invalidateQueries({ queryKey: ["conversation-runs"] })];
+      if (!deleted) resumed.push(queryClient.invalidateQueries({ queryKey: ["run-detail", runId], exact: true }));
+      await Promise.all(resumed);
+    }
   };
 
   return (
     <div ref={ref} className="relative">
+      {deleteError && deleteError.runId === runId && <p role="alert" className="text-xs" style={{ color: C.red }}>{deleteError.message}</p>}
       <button
         ref={triggerRef}
         type="button"
@@ -412,8 +454,9 @@ function MoreMenu({ runId, deleteRedirectPath = "/runs" }: { runId?: string; del
             className="w-full text-left px-3 py-2 text-[11px] transition-colors hover:bg-[color:var(--rp-ink-wash)]"
             style={{ color: C.red }}
             onClick={handleDelete}
+            disabled={deleting}
           >
-            Delete run
+            {deleting ? "Deleting…" : "Delete run"}
           </button>
         </div>
       )}
@@ -508,9 +551,23 @@ function annotationToSavedPreview(annotation: Annotation): SavedAnnotationPrevie
   };
 }
 
+function ReplayRegistryNotice({ status, onRetry }: {
+  status: "pending" | "error";
+  onRetry: () => Promise<void>;
+}) {
+  return (
+    <div role={status === "pending" ? "status" : "alert"} className="text-[11px]" style={{ color: status === "error" ? C.red : C.fg1 }}>
+      {status === "pending" ? "Checking agent replay setup…" : <>
+        Could not load agent replay setup.{" "}
+        <button type="button" aria-label="Retry agent replay setup" className="underline" onClick={() => { void onRetry(); }}>Retry</button>
+      </>}
+    </div>
+  );
+}
+
 function ViewHeader({
   title, model, active, stats, allSpans, startedAt, anthropicModels,
-  run, isReplay, breadcrumb, fork, onAnnotateRun, annotationError, onDownload, deleteRedirectPath,
+  run, isReplay, breadcrumb, fork, onAnnotateRun, annotationError, onDownload,
 }: {
   title: string;
   model?: string | null;
@@ -529,7 +586,6 @@ function ViewHeader({
   onAnnotateRun?: (input: { kind: AnnotationKind; note: string }) => Promise<Annotation | null>;
   annotationError?: string | null;
   onDownload?: () => void;
-  deleteRedirectPath?: string;
 }) {
   const onBack = breadcrumb?.onBack;
   const parentName = breadcrumb?.parentName;
@@ -546,7 +602,7 @@ function ViewHeader({
   // Live registry lookup — re-renders whenever the server broadcasts
   // `agents_updated` (e.g. after the user runs `runphantom setup` or hits
   // `/api/agents/refresh`).
-  const { configured: agentConfigured } = useAgentForEvent(run?.event_name);
+  const { configured: agentConfigured, registryStatus: agentRegistryStatus, refetch: refetchAgents } = useAgentForEvent(run?.event_name);
   const forkMode = "local" as const;
   const [setupModalOpen, setSetupModalOpen] = useState(false);
   const [isSaved, setIsSaved] = useState(() => run ? isEventSaved(run.id) : false);
@@ -674,7 +730,7 @@ function ViewHeader({
             <span style={{ color: C.fg0, opacity: 0.4 }}>|</span>
             <StatsLine stats={stats} model={model} spans={allSpans} active={active} startedAt={startedAt} />
           </div>
-          <MoreMenu runId={run?.id} deleteRedirectPath={deleteRedirectPath} />
+          <MoreMenu runId={run?.id} />
         </div>
       ) : (
         <>
@@ -791,12 +847,14 @@ function ViewHeader({
                   return <>
                   <div className="rp-clipped-ring flex items-stretch rounded-md overflow-hidden" style={{ border: `1px solid var(--rp-ink-a10)` }}>
                     <button
-                      className="flex items-center gap-1.5 text-[11px] px-3 py-1 font-medium transition-colors rp-hover-wash"
+                      disabled={agentRegistryStatus !== "success"}
+                      className="flex items-center gap-1.5 text-[11px] px-3 py-1 font-medium transition-colors rp-hover-wash disabled:opacity-50"
                       style={{
                         color: C.fg3,
                         background: "var(--rp-ink-a06)",
                       }}
                       onClick={() => {
+                        if (agentRegistryStatus !== "success") return;
                         if (agentConfigured) {
                           onFork(undefined, forkMode, forkModel || undefined);
                         } else {
@@ -814,7 +872,8 @@ function ViewHeader({
                       aria-expanded={optionsOpen}
                       aria-controls={optionsOpen ? replayOptionsId : undefined}
                       aria-haspopup="dialog"
-                      className="flex items-center justify-center px-1.5 transition-colors rp-hover-wash"
+                      disabled={agentRegistryStatus !== "success"}
+                      className="flex items-center justify-center px-1.5 transition-colors rp-hover-wash disabled:opacity-50"
                       style={{ color: C.fg1, background: "var(--rp-ink-a06)", borderLeft: "1px solid var(--rp-ink-a10)" }}
                       onClick={() => {
                         setAnnotationPopoverOpen(false);
@@ -825,6 +884,7 @@ function ViewHeader({
                       <ChevronDown className="h-3.5 w-3.5" />
                     </button>
                   </div>
+                  {agentRegistryStatus !== "success" && <ReplayRegistryNotice status={agentRegistryStatus} onRetry={refetchAgents} />}
                   <SetupReplayModal
                     open={setupModalOpen}
                     onClose={() => setSetupModalOpen(false)}
@@ -844,7 +904,7 @@ function ViewHeader({
                         el.style.right = `${window.innerWidth - btn.right}px`;
                       }}
                       style={{ background: "var(--rp-surface)", border: "1px solid var(--rp-border)", boxShadow: "var(--rp-e3)", width: "min(384px, calc(100vw - 32px))" }}>
-                      {!agentConfigured && (
+                      {agentRegistryStatus === "success" && !agentConfigured && (
                         <LocalAgentSetupCTA eventName={run?.event_name ?? undefined} />
                       )}
                       <div>
@@ -897,13 +957,15 @@ function ViewHeader({
                         </div>
                       )}
                       <button
-                        className="w-full py-1.5 rounded text-[11px] font-medium transition-colors hover:brightness-110"
+                        disabled={agentRegistryStatus !== "success"}
+                        className="w-full py-1.5 rounded text-[11px] font-medium transition-colors hover:brightness-110 disabled:opacity-50"
                         style={{
                           background: "var(--rp-ink-a08)",
                           color: C.fg4,
                           border: `1px solid var(--rp-ink-a10)`,
                         }}
                         onClick={() => {
+                          if (agentRegistryStatus !== "success") return;
                           if (!agentConfigured) {
                             setOptionsOpen(false);
                             setSetupModalOpen(true);
@@ -922,7 +984,7 @@ function ViewHeader({
                   )}
                 </>;
                 })()}
-                <MoreMenu runId={run?.id} deleteRedirectPath={deleteRedirectPath} />
+                <MoreMenu runId={run?.id} />
               </div>
             )}
           </div>
@@ -959,7 +1021,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
   // Live registry lookup; re-renders on `agents_updated` WS event, so the
   // modal reflects registry changes that happen while it's open (rare but
   // possible if the user runs the slash command in another window).
-  const { configured: agentConfigured } = useAgentForEvent(eventName);
+  const { configured: agentConfigured, registryStatus: agentRegistryStatus, refetch: refetchAgents } = useAgentForEvent(eventName);
   const [agentContext, setAgentContext] = useState<Record<string, string>>({});
   const [contextEdits, setContextEdits] = useState<Record<string, string>>({});
 
@@ -976,7 +1038,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
     }).catch(() => {});
   }, [runId, eventName, agentConfigured]);
 
-  useDialogFocus(agentConfigured, dialogRef, onClose);
+  useDialogFocus(agentRegistryStatus !== "success" || agentConfigured, dialogRef, onClose);
   const modalModelOptions = useMemo(() => buildReplayModelOptions({
     selectedModel: mdl,
     runModel: model,
@@ -985,6 +1047,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
   }), [mdl, model, traceModelFromMetadata, anthropicModels]);
 
   const handleReplay = () => {
+    if (agentRegistryStatus !== "success" || !agentConfigured) return;
     const ctxOverrides = mode === "local" && Object.keys(contextEdits).length > 0
       ? Object.fromEntries(Object.entries(contextEdits).filter(([k, v]) => v !== String(agentContext[k] ?? "")))
       : undefined;
@@ -992,7 +1055,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
     onReplay(msg, mode, mdl || undefined, Object.keys(ctxOverrides ?? {}).length ? ctxOverrides : undefined);
   };
 
-  if (!agentConfigured) {
+  if (agentRegistryStatus === "success" && !agentConfigured) {
     return (
       <SetupReplayModal
         open={true}
@@ -1011,6 +1074,7 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
           border: "1px solid var(--rp-border)", boxShadow: "var(--rp-e4)",
         }}>
         <h2 id="edit-replay-title" className="text-[13px] font-semibold" style={{ color: C.fg3 }}>Edit &amp; Replay</h2>
+        {agentRegistryStatus !== "success" && <ReplayRegistryNotice status={agentRegistryStatus} onRetry={refetchAgents} />}
 
         <div>
           <div className="text-[10px] font-medium mb-1" style={{ color: C.fg0 }}>Model</div>
@@ -1073,7 +1137,8 @@ function EditReplayModal({ userMessage, model, runId, eventName, traceModelFromM
             Cancel
           </button>
           <button
-            className="px-4 py-1.5 rounded-lg text-[11px] font-medium transition-colors hover:brightness-110"
+            disabled={agentRegistryStatus !== "success"}
+            className="px-4 py-1.5 rounded-lg text-[11px] font-medium transition-colors hover:brightness-110 disabled:opacity-50"
             style={{
               color: C.fg4,
               background: "var(--rp-ink-a10)",
@@ -1279,13 +1344,17 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
   // new one: the URL showed trace B while the pane rendered trace A. Every write
   // below is gated on the request still being the current one.
   const detailRequestRef = useRef(0);
+  const detailAbortRef = useRef<AbortController | null>(null);
 
   const fetchData = useCallback(async () => {
-    if (initialData) return; // Skip DB fetch when data is provided directly
+    if (initialData || isRunDeleting(runId)) return; // Keep the visible trace during deletion.
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
     const requestId = ++detailRequestRef.current;
-    const isCurrent = () => detailRequestRef.current === requestId;
+    const isCurrent = () => detailRequestRef.current === requestId && !controller.signal.aborted;
     try {
-      const res = await fetch(`/api/runs/detail/${runId}`);
+      const res = await fetch(`/api/runs/detail/${runId}`, { signal: controller.signal });
       if (!isCurrent()) return;
       if (res.status === 404) {
         setData(null);
@@ -1305,6 +1374,35 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
     }
     finally { if (isCurrent()) setLoading(false); }
   }, [runId, initialData]);
+
+  useEffect(() => {
+    // The selected view owns navigation: the menu that started deletion may
+    // have unmounted while the user visited another trace and returned here.
+    const onRemoved = (event: Event) => {
+      if ((event as CustomEvent<{ runId: string }>).detail.runId !== runId) return;
+      navigate(routeBase ?? "/runs", { replace: true, flushSync: true });
+    };
+    window.addEventListener("runphantom:run-removed", onRemoved);
+    return () => window.removeEventListener("runphantom:run-removed", onRemoved);
+  }, [navigate, routeBase, runId]);
+
+  useEffect(() => {
+    let wasDeleting = isRunDeleting(runId);
+    const unsubscribe = subscribeRunDeletions(() => {
+      const deleting = isRunDeleting(runId);
+      if (deleting) {
+        ++detailRequestRef.current;
+        detailAbortRef.current?.abort();
+      } else if (wasDeleting) {
+        void fetchData(); // A failed delete leaves the trace selected and live.
+      }
+      wasDeleting = deleting;
+    });
+    return () => {
+      unsubscribe();
+      detailAbortRef.current?.abort();
+    };
+  }, [runId, fetchData]);
 
   useEffect(() => {
     if (initialData) return;
@@ -1537,7 +1635,6 @@ export function RunDetail({ runId, routeBase, initialData, isReplay, onForkStart
         allSpans={spans}
         run={run}
         isReplay={isReplay}
-        deleteRedirectPath={routeBase ?? "/runs"}
         onAnnotateRun={(input) => createAnnotationAndSave({ ...input, source: "user" })}
         annotationError={annotationsApi.error}
         onDownload={downloadTrace}

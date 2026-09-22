@@ -9,7 +9,7 @@ import { Markdown } from "./Markdown";
 import type { Run } from "../utils/types";
 import { buildConvoEvents } from "./convo-events";
 import { useRunPhantomEvent } from "../hooks/use-runphantom-ws";
-import { useConversationDetail } from "../hooks/use-runs";
+import { isRunDeleting, useConversationDetail } from "../hooks/use-runs";
 
 function ConversationHeader({ runCount }: { runCount: number }) {
   return (
@@ -76,11 +76,13 @@ export function ConvoDetail({ convoId, onOpenTurn }: { convoId: string; onOpenTu
   useRunPhantomEvent("spans", () => {
     void queryClient.invalidateQueries({ queryKey: ["conversation-runs", convoId] });
     for (const runId of runIds) {
+      if (isRunDeleting(runId)) continue;
       void queryClient.invalidateQueries({ queryKey: ["run-detail", runId] });
     }
   });
   useRunPhantomEvent("live", () => {
     for (const runId of runIds) {
+      if (isRunDeleting(runId)) continue;
       void queryClient.invalidateQueries({ queryKey: ["run-detail", runId] });
     }
   });

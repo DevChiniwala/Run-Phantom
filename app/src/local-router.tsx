@@ -16,7 +16,7 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { VerificationPage } from "./pages/VerificationPage";
 import { EvaluationsPage } from "./pages/EvaluationsPage";
 import { RouteError } from "./components/RouteError";
-import { sendRunPhantomMessage, useRunPhantomConnected } from "./hooks/use-runphantom-ws";
+import { sendRunPhantomMessage, useRunPhantomConnectionStatus } from "./hooks/use-runphantom-ws";
 import { useAgentUiCommands } from "./hooks/use-agent-ui-commands";
 import { useDialogFocus } from "./hooks/use-dialog-focus";
 import { safeDecodeParam } from "./utils/helpers";
@@ -30,12 +30,12 @@ function AppLayout() {
   const activeRunId = runMatch?.params.runId
     ? safeDecodeParam(runMatch.params.runId)
     : null;
-  const runPhantomConnected = useRunPhantomConnected();
+  const connectionStatus = useRunPhantomConnectionStatus();
   useAgentUiCommands();
   useDialogFocus(showDisconnectedNotice, disconnectedDialogRef);
 
   useEffect(() => {
-    if (runPhantomConnected) {
+    if (connectionStatus !== "disconnected") {
       setShowDisconnectedNotice(false);
       return;
     }
@@ -43,7 +43,7 @@ function AppLayout() {
       setShowDisconnectedNotice(true);
     }, DISCONNECTED_NOTICE_DELAY_MS);
     return () => window.clearTimeout(timeout);
-  }, [runPhantomConnected]);
+  }, [connectionStatus]);
 
   useEffect(() => {
     sendRunPhantomMessage({ type: "ui_view", run_id: activeRunId });

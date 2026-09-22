@@ -168,6 +168,7 @@ function SpanTooltip({
 export function FlameTimeline({ spans }: { spans: Span[] }) {
   const colorMap = useMemo(() => new Map<string, string>(), []);
   const vizSpans = useMemo(() => spans.filter(s => s.span_type === "TRACE" || s.span_type === "TOOL_CALL" || s.span_type?.includes("LLM")), [spans]);
+  const hasVizSpans = vizSpans.length > 0;
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(0);
   const [hovered, setHovered] = useState<{ span: Span; rect: DOMRect } | null>(null);
@@ -196,7 +197,7 @@ export function FlameTimeline({ spans }: { spans: Span[] }) {
     const ro = new ResizeObserver(([entry]) => setContainerW(entry.contentRect.width));
     ro.observe(containerRef.current);
     return () => ro.disconnect();
-  }, []);
+  }, [hasVizSpans]);
 
   const handleBarEnter = useCallback((span: Span, e: React.SyntheticEvent<HTMLElement>) => {
     cancelTooltipDismiss();
@@ -210,7 +211,7 @@ export function FlameTimeline({ spans }: { spans: Span[] }) {
     scheduleTooltipDismiss();
   }, [scheduleTooltipDismiss]);
 
-  if (vizSpans.length === 0) return null;
+  if (!hasVizSpans) return null;
 
   const minT = Math.min(...vizSpans.map(s => s.start_time_ms));
   const maxT = Math.max(...vizSpans.map(s => s.end_time_ms));

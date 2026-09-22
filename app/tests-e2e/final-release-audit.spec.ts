@@ -458,11 +458,12 @@ test("release audit: mobile navigation exposes an explicit close control", async
   await expect(navigation).toHaveCount(0);
 });
 
-test("release audit: keyboard users receive a visible skip target", async ({ page, runPhantom }) => {
+test("release audit: keyboard users receive a visible skip target", async ({ page, runPhantom, browserName }) => {
   await page.goto(`${runPhantom.url}/runs`);
   // Document load can precede the asynchronously imported local layout.
   await expect(page.getByRole("link", { name: "Skip to trace workspace", exact: true })).toBeAttached();
-  await page.keyboard.press("Tab");
+  // Safari on macOS uses Option-Tab to include links in keyboard traversal.
+  await page.keyboard.press(browserName === "webkit" && process.platform === "darwin" ? "Alt+Tab" : "Tab");
 
   const active = page.locator(":focus");
   await expect(active).toHaveText("Skip to trace workspace");

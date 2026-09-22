@@ -11,6 +11,7 @@ import { createEvaluationRouter } from "../src/evaluations/router";
 import { loadSnapshot } from "../src/evaluations/loader";
 import * as store from "../src/evaluations/store";
 import { EVALUATION_LIMITS as L, type Experiment, type Rule, type RuleResult } from "../src/evaluations/protocol";
+import { evaluationsApi } from "../app/src/api/evaluations";
 
 let directory: string, oldDb: string | undefined;
 const services: EvaluationService[] = [];
@@ -164,6 +165,33 @@ describe("evaluation workbench backend", () => {
     expect(cancelled.results[0].checks.map((check) => check.status)).toEqual(["fail", "inconclusive"]);
     expect(cancelled.summary).toMatchObject({ total: 1, fail: 1, passRate: 0 });
     gate.resolve(); await pause(20); expect(s.getExperiment(queued.id)).toEqual(cancelled);
+  });
+  test("UI cancellation client reaches the daemon and preserves interrupted checks", async () => {
+    const { createServer } = await import("../src/server");
+    const { server } = await createServer(0);
+    server.listen(0, "127.0.0.1"); await once(server, "listening");
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const gate = deferredJudge(), s = service({ judge: gate.judge });
+    run(); const revision = dataset(s, [outputRule, rubric]);
+    const queued = start(s, revision, "candidate", true);
+    const fetchRequest = globalThis.fetch;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => fetchRequest(
+      typeof input === "string" && input.startsWith("/") ? new URL(input, base) : input, init,
+    ), { preconnect: fetchRequest.preconnect }));
+    try {
+      await until(gate.calls, (calls) => calls === 1);
+      const cancelled = await evaluationsApi.cancel(queued.id);
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.verdict).toBe("inconclusive");
+      expect(cancelled.results[0].checks.map((check) => check.status)).toEqual(["pass", "inconclusive"]);
+      expect(cancelled.results[0].checks[1].reason).toContain("Cancelled");
+      expect(await evaluationsApi.experiment(queued.id)).toEqual(cancelled);
+      gate.resolve(); await pause(20);
+      expect(await evaluationsApi.experiment(queued.id)).toEqual(cancelled);
+    } finally {
+      fetchSpy.mockRestore(); gate.resolve(); s.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
   test("restart recovery preserves completed checks and never resumes judges or allows old jobs to replace terminal data", async () => {
     const gate = deferredJudge(), old = service({ judge: gate.judge }); run();
