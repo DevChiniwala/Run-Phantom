@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { flushSync } from "react-dom";
-import { isRunDeleting, setRunDeleting, subscribeRunDeletions } from "../hooks/use-runs";
+import { isRunDeleting, setRunDeleting, subscribeRunDeletions, setRunDeletionError, useRunDeletionError, useRunDeletions } from "../hooks/use-runs";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   runPath,
@@ -358,15 +358,9 @@ function MoreMenu({ runId }: { runId?: string }) {
   const deleteRef = useRef<HTMLButtonElement>(null);
   const menuId = useId();
   const queryClient = useQueryClient();
-  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
-  const [deleteError, setDeleteError] = useState<{ runId: string; message: string } | null>(null);
-  const currentRunId = useRef(runId);
-  currentRunId.current = runId;
-  const deleting = deletingRunId === runId;
-  useEffect(() => {
-    currentRunId.current = runId;
-    return () => { currentRunId.current = undefined; };
-  }, [runId]);
+  const deletingRuns = useRunDeletions();
+  const deleteError = useRunDeletionError(runId);
+  const deleting = !!runId && deletingRuns.has(runId);
 
   useEffect(() => {
     if (!open) return;
@@ -390,8 +384,7 @@ function MoreMenu({ runId }: { runId?: string }) {
 
   const handleDelete = async () => {
     if (!runId || isRunDeleting(runId) || !confirm("Delete this run and all its spans?")) return;
-    setDeletingRunId(runId);
-    setDeleteError(null);
+    setRunDeletionError(runId, null);
     setRunDeleting(runId, true);
     let deleted = false;
     try {
@@ -413,12 +406,9 @@ function MoreMenu({ runId }: { runId?: string }) {
       });
       queryClient.removeQueries({ queryKey: ["run-detail", runId], exact: true });
     } catch (error) {
-      if (currentRunId.current === runId) {
-        setDeleteError({ runId, message: error instanceof Error ? error.message : "Could not delete run" });
-      }
+      setRunDeletionError(runId, error instanceof Error ? error.message : "Could not delete run");
     } finally {
       setRunDeleting(runId, false);
-      setDeletingRunId(current => current === runId ? null : current);
       // A canceled conversation may now belong to another selected run. Restart
       // active lists for either outcome, but never refetch a deleted detail.
       const resumed = [queryClient.invalidateQueries({ queryKey: ["conversation-runs"] })];
@@ -429,7 +419,7 @@ function MoreMenu({ runId }: { runId?: string }) {
 
   return (
     <div ref={ref} className="relative">
-      {deleteError && deleteError.runId === runId && <p role="alert" className="text-xs" style={{ color: C.red }}>{deleteError.message}</p>}
+      {deleteError && <p role="alert" className="text-xs" style={{ color: C.red }}>{deleteError}</p>}
       <button
         ref={triggerRef}
         type="button"

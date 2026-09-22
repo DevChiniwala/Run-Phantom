@@ -8,6 +8,98 @@ function gate() {
   return { promise, release };
 }
 
+test("deletion replaces held initial and broadcast lists without another event", async ({ page, runPhantom }) => {
+  await clearRunPhantom(runPhantom.url);
+  await seedRunPhantomFixtures(runPhantom.url);
+  const initialHeld = gate();
+  const broadcastHeld = gate();
+  const listsRelease = gate();
+  const deleteHeld = gate();
+  const deleteRelease = gate();
+  let listRequests = 0;
+  let heldLists = 0;
+  let deliveredLists = 0;
+  let deletionSettled = false;
+  await page.route(`${runPhantom.url}/api/runs`, async route => {
+    const requestNumber = ++listRequests;
+    const held = !deletionSettled;
+    const response = await route.fetch();
+    if (held) {
+      heldLists++;
+      if (requestNumber === 1) initialHeld.release();
+      const runs = await response.json() as Array<{ id: string }>;
+      if (!runs.some(run => run.id === FIXTURE_PRIMARY_RUN_ID)) broadcastHeld.release();
+      await listsRelease.promise;
+    }
+    await route.fulfill({ response });
+    if (held) deliveredLists++;
+  });
+  await page.route(`**/api/runs/${FIXTURE_PRIMARY_RUN_ID}`, async route => {
+    const response = await route.fetch(); // The real daemon broadcasts the deletion.
+    expect(response.ok()).toBe(true);
+    deleteHeld.release();
+    await deleteRelease.promise;
+    deletionSettled = true;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+    await initialHeld.promise;
+    await page.getByRole("button", { name: "More actions" }).click();
+    page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("menuitem", { name: "Delete run" }).click();
+    await Promise.all([deleteHeld.promise, broadcastHeld.promise]);
+    deleteRelease.release();
+    await expect(page).not.toHaveURL(new RegExp(FIXTURE_PRIMARY_RUN_ID));
+    // No further websocket frame is sent: deletion must request its own list.
+    await expect(page.locator(`[data-run-id="${FIXTURE_SAVED_SIBLING_RUN_ID}"]`)).toBeVisible();
+    listsRelease.release();
+    await expect.poll(() => deliveredLists).toBe(heldLists);
+    await expect(page.locator(`[data-run-id="${FIXTURE_PRIMARY_RUN_ID}"]`)).toHaveCount(0);
+    await expect(page.locator(`[data-run-id="${FIXTURE_SAVED_SIBLING_RUN_ID}"]`)).toBeVisible();
+  } finally { deleteRelease.release(); listsRelease.release(); }
+});
+
+test("returning to a pending deletion retains its failure and permits retry", async ({ page, runPhantom }) => {
+  await clearRunPhantom(runPhantom.url);
+  await seedRunPhantomFixtures(runPhantom.url);
+  const held = gate();
+  const release = gate();
+  let attempts = 0;
+  await page.route(`**/api/runs/${FIXTURE_PRIMARY_RUN_ID}`, async route => {
+    if (++attempts > 1) return route.continue();
+    held.release();
+    await release.promise;
+    await route.fulfill({ status: 503, json: { error: "Delete temporarily unavailable" } });
+  });
+  try {
+    await page.goto(`${runPhantom.url}/runs/${FIXTURE_PRIMARY_RUN_ID}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("menuitem", { name: "Delete run" }).click();
+    await held.promise;
+    await page.locator(`[data-run-id="${FIXTURE_SAVED_SIBLING_RUN_ID}"]`).click();
+    await expect(page.getByRole("button", { name: "More actions" })).toBeVisible();
+    await page.locator(`[data-run-id="${FIXTURE_PRIMARY_RUN_ID}"]`).click();
+    await expect(page).toHaveURL(new RegExp(`${FIXTURE_PRIMARY_RUN_ID}$`));
+    release.release();
+    await expect(page.getByRole("alert")).toHaveText("Delete temporarily unavailable");
+    await expect(page).toHaveURL(new RegExp(`${FIXTURE_PRIMARY_RUN_ID}$`));
+    await page.locator(`[data-run-id="${FIXTURE_SAVED_SIBLING_RUN_ID}"]`).click();
+    await expect(page.getByRole("button", { name: "More actions" })).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await page.locator(`[data-run-id="${FIXTURE_PRIMARY_RUN_ID}"]`).click();
+    await expect(page.getByRole("alert")).toHaveText("Delete temporarily unavailable");
+    await page.getByRole("button", { name: "More actions" }).click();
+    page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("menuitem", { name: "Delete run" }).click();
+    await expect(page).not.toHaveURL(new RegExp(FIXTURE_PRIMARY_RUN_ID));
+    await expect(page.locator(`[data-run-id="${FIXTURE_PRIMARY_RUN_ID}"]`)).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(attempts).toBe(2);
+  } finally { release.release(); }
+});
+
 for (const view of ["", "/convo"]) {
   test(`deletion suspends selected detail reads until the held DELETE settles (${view || "overview"})`, async ({ page, runPhantom }) => {
     await clearRunPhantom(runPhantom.url);
